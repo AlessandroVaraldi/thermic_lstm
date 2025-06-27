@@ -39,7 +39,7 @@ The aim is real-time prediction of MOSFET junction temperature, with a clean com
 | PyTorch   | 2.2 (built for your CUDA) | verify with `python -m torch.utils.collect_env` |
 | Optuna    | 3.6             | hyper-parameter optimisation |
 | SciPy / NumPy / Matplotlib | latest | plotting and ODE reference |
-| Requests  | any             | Telegram notifications |
+| Requests (optional) | any             | Telegram notifications |
 | Thop (optional) | any | FLOP and parameter counting |
 
 Training is much faster on a mid-range GPU. Automatic mixed precision halves VRAM usage and speeds up training.
@@ -69,7 +69,7 @@ Training is much faster on a mid-range GPU. Automatic mixed precision halves VRA
 Optional extras
 
     pip install thop         # FLOP / parameter counter
-    pip install requests     # already in requirements, used by Telegram helper
+    pip install requests     # used by Telegram helper
 
 ### 4.3 Check CUDA availability
 

@@ -101,8 +101,8 @@ Notifications activate automatically when both variables are present. Omit them 
 
 ## 6. Quick start
 
-    git clone https://github.com/your-org/lstm-therminic.git
-    cd lstm-therminic
+    git clone https://github.com/AlessandroVaraldi/thermic_lstm.git
+    cd thermic_lstm
 
 Run thirty trials per Optuna study (≈ 10 min on an RTX 3060):
 

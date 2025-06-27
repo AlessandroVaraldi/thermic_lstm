@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+
+# CSV logs
+logs/
+*.csv
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,4 +1,4 @@
-# LSTM × Therminic
+# Title
 
 Tiny but complete reference that joins a **single-RC thermal network** and a lightweight **dot-product-attention LSTM**.  
 The aim is real-time prediction of MOSFET junction temperature, with a clean comparison against the analytical ODE.

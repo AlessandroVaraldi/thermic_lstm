@@ -1,4 +1,3 @@
-````markdown
 # LSTM × Therminic
 
 Tiny but complete reference that joins a **single-RC thermal network** and a lightweight **dot-product-attention LSTM**.  

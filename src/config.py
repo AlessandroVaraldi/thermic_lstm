@@ -54,9 +54,9 @@ NUM_LAYERS  = 1   # int
 
 # Scaling factor applied to the physics-informed penalties (steady-state
 # loss).
-LAMBDA_SS = 1e-5  # float ≥ 0
+LAMBDA_SS = 9.78e-6  # float ≥ 0
 # Scaling factor applied to the thermal resistance loss.
-LAMBDA_TR = 1e-5  # float ≥ 0
+LAMBDA_TR = 2.15e-6  # float ≥ 0
 
 # --------------------------------------------------------------------
 # NEW: scheduler warm-up

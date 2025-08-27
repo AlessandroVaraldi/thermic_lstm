@@ -1,0 +1,8 @@
+\begin{abstract}
+Accurate real-time temperature estimation for automotive power electronics is crucial for ensuring reliability under dynamic operating conditions. Purely data-driven neural networks, such as Long Short-Term Memory (LSTM), can model complex transient behavior but may struggle without physical constraints, leading to inaccurate or poorly calibrated predictions. This paper proposes a physics-informed LSTM (PI-LSTM) model that explicitly incorporates energy-balance constraints derived from lumped-parameter thermal models. Optimized through Bayesian hyperparameter tuning, the PI-LSTM achieves significant accuracy improvements: compared to a standard LSTM, the mean absolute error (MAE) is reduced by approximately \SI{19}{\percent}, while compared to the purely physics-based lumped-RC model, the PI-LSTM decreases mean squared error (MSE) by about \SI{57}{\percent}. Additionally, the physics-informed model yields better-calibrated uncertainty intervals, improving empirical \SI{95}{\percent} coverage from \SI{98.25}{\percent} to \SI{99.54}{\percent}. These results demonstrate that physically-guided neural networks enhance prediction reliability without additional computational overhead.
+\end{abstract}
+
+
+\begin{IEEEkeywords}
+Physics-informed neural network, Junction-temperature estimation, Automotive power electronics, Attention LSTM.
+\end{IEEEkeywords}

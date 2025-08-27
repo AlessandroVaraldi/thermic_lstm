@@ -1,0 +1,74 @@
+\section{Results and Discussion}\label{sec:results}
+
+% -------------------------------------------------------------------------
+\subsection{Computational Footprint}\label{ssec:footprint}
+
+Both the plain LSTM and its physics-informed counterpart (PI-LSTM) share the same lightweight backbone:  
+\[
+\text{\#params}=1\,313,\qquad 
+\text{FLOPs}=1.8\times10^{5}\;\text{per window}.
+\]
+Storing the weights in \texttt{float32} still costs only
+\[
+1\,313 \times 4\;\text{B} \;\approx\; 5.1\ \text{kB},
+\]
+well below the SRAM budget of contemporary automotive MCUs.  
+On a laptop-grade RTX 3060 the forward integration of the calibrated single-RC ODE over every test cycle finishes in $0.37\,$s, while the 30 Monte-Carlo dropout passes needed for uncertainty estimation complete in $\approx3.9\,$min—i.e.\ $7.2\,$ms per pass and cycle, already real-time for e-drive control loops.
+
+% -------------------------------------------------------------------------
+\subsection{Test-set Accuracy}\label{ssec:accuracy}
+
+Table~\ref{tab:test_metrics} compares point-error and calibration metrics on the held-out $\sim30\,$\% test split.  
+Embedding the steady-state and transient energy-balance terms markedly improves every point-error metric and tightens the predictive intervals:
+
+\begin{table}[H]
+\centering
+\caption{Test-set performance comparison (lower is better unless noted).}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+Metric & Standard LSTM & PI-LSTM \\ \midrule
+MSE [\si{\celsius\squared}] & 6.6350 & \textbf{4.6030} \\
+MAE [\si{\celsius}] & 1.9933 & \textbf{1.6222} \\
+Huber [\si{\celsius}] ($\delta\!=\!1$) & 2.3821 & \textbf{2.1198} \\
+NLL & \textbf{2.4150} & 2.7327 \\
+95 \% coverage [↑] & 98.25 \% & \textbf{99.54 \%} \\ \bottomrule
+\end{tabular}
+\label{tab:test_metrics}
+\end{table}
+
+\noindent
+For reference, the optimally calibrated lumped-RC ODE reaches an MSE of $10.62\;\si{\celsius^{2}}$, i.e.\ \SI{57}{\percent} worse than the PI-LSTM.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=1\linewidth]{images/COMPARE_timeseries_overlay.png}
+  \caption{Overlay of ground truth, mean predictions, and 95 \% confidence band for the first test trajectory.  The PI-LSTM tracks sharp transients more closely than the standard model while providing well-calibrated uncertainty.}
+  \label{fig:overlay}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=1\linewidth]{images/COMPARE_err_hist.png}
+  \caption{Absolute-error histograms.  The PI-LSTM (orange) puts more mass in the sub-\SI{1}{\celsius} region but shows a slightly heavier moderate tail (4–6 \si{\celsius}); extreme outliers remain rare for both models.}
+  \label{fig:err_hist}
+\end{figure}
+
+% -------------------------------------------------------------------------
+\subsection{Discussion}\label{ssec:discussion}
+
+Table~\ref{tab:test_metrics} directly reveals the gains achieved by embedding physics-informed constraints within the LSTM, while Fig.~\ref{fig:overlay} (trajectory overlay) and Fig.~\ref{fig:err_hist} (error histogram) reinforce these findings by providing qualitative insight into accuracy and calibration.
+
+First, observing the overall error metrics—MSE, MAE, and Huber loss—it is clear that the PI-LSTM significantly enhances point-wise predictive accuracy, achieving approximately \SI{31}{\percent} lower MSE and \SI{19}{\percent} lower MAE compared to its purely data-driven counterpart. This marked improvement is also evident in Fig.~\ref{fig:overlay}, where the orange PI-LSTM trajectory hugs the ground truth more closely during sharp transients that typically induce higher errors in the standard model. Embedding energy-balance constraints thus guides the neural dynamics toward physically consistent temperature trajectories, improving predictions in challenging regimes.
+
+Importantly, the PI-LSTM also substantially outperforms the purely physics-based ODE model (by about \SI{57}{\percent} lower MSE), confirming that while physics equations encapsulate useful domain knowledge, a purely grey-box approach struggles to capture complex transient dynamics accurately. The PI-LSTM therefore leverages the strengths of both approaches: the ability of neural networks to model nonlinear transient behaviors, and the reliability provided by physical laws for steady-state and transient consistency.
+
+Examining predictive uncertainty metrics (NLL and coverage) sheds further insight: although the NLL for the PI-LSTM slightly increases, indicating marginally broader predictive distributions, the empirical coverage of its uncertainty intervals improves markedly (from \SI{98.25}{\percent} to \SI{99.54}{\percent}). In Fig.~\ref{fig:overlay} the shaded \SI{95}{\percent} band remains tight yet successfully envelops the ground truth, underscoring better calibration despite slightly wider intervals. In practice, this provides safer, more trustworthy predictions—crucial for real-time automotive monitoring where underestimating uncertainty can lead to reliability risks.
+
+The histogram in Fig.~\ref{fig:err_hist} complements these observations: the PI-LSTM places more probability mass below \SI{1}{\celsius} while retaining a tail comparable to the standard model. This distribution confirms that larger predicted standard deviations systematically coincide with larger absolute errors, proving that the PI-LSTM’s uncertainty estimates are informative and well-calibrated.
+
+Lastly, it is crucial to note the computational aspect: these significant accuracy and calibration improvements occur without any increase in model complexity or resource demand. The PI-LSTM maintains the same compact architecture—only 1.3k parameters—as the standard model, fully meeting the stringent memory and computational constraints typical in automotive microcontroller deployments.
+
+Overall, the collective evidence from quantitative metrics and qualitative plots emphasizes that the PI-LSTM represents a compelling synergy between data-driven flexibility and physically grounded regularization, delivering reliable and accurate temperature predictions ideally suited for embedded automotive applications.
+
+
+

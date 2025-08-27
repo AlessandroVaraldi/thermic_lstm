@@ -9,44 +9,33 @@ import numpy as np
 from src.data_utils import sliding_windows
 
 class WindowDataset(Dataset):
-    def __init__(self,
-                 full_inputs: np.ndarray,
-                 full_targets: np.ndarray,
-                 mu_x: np.ndarray | None = None,
-                 std_x: np.ndarray | None = None,
-                 mu_y: float | None = None,
-                 std_y: float | None = None):
-        """
-        Parameters
-        ----------
-        full_inputs  : array shape (N, n_features)
-        full_targets : array shape (N,)
-        mu_x, std_x  : array shape (n_features,)  (calcolati sul train-set)
-        mu_y, std_y  : scalari                        idem
-        """
-        # ---------------- sliding windows
-        X_win, y_fin = sliding_windows(full_inputs, full_targets)
+    def __init__(self, full_inputs, full_targets, mu_x=None, std_x=None, mu_y=None, std_y=None):
+        # 1) crea SOLO la vista (niente copie)
+        X_view, y_fin = sliding_windows(full_inputs, full_targets)  # X_view è una view stridata
+        mask = np.isfinite(X_view).all(axis=(1, 2)) & np.isfinite(y_fin)
 
-        # ---------------- optional normalisation
-        if mu_x is not None and std_x is not None:
-            X_win = (X_win - mu_x) / std_x
-        if mu_y is not None and std_y is not None:
-            y_fin = (y_fin - mu_y) / std_y
+        # 2) salva la sorgente + indici validi (niente X_view[mask]!)
+        self.X_view = X_view
+        self.y_fin  = y_fin
+        self.idx    = np.nonzero(mask)[0].astype(np.int64)
 
-        # ---------------- drop windows with NaN / inf
-        mask = np.isfinite(X_win).all(axis=(1, 2)) & np.isfinite(y_fin)
-        X_win, y_fin = X_win[mask], y_fin[mask]
-
-        # ---------------- tensors
-        self.X = torch.from_numpy(X_win).float()
-        self.y = torch.from_numpy(y_fin).float()
-
-        # store stats for inverse transform (utile in evaluate)
+        # 3) statistiche per normalizzazione on-the-fly
         self.mu_x, self.std_x = mu_x, std_x
         self.mu_y, self.std_y = mu_y, std_y
 
     def __len__(self):
-        return self.X.shape[0]
+        return int(self.idx.shape[0])
 
-    def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
+    def __getitem__(self, i):
+        k = int(self.idx[i])
+        Xw = self.X_view[k]          # shape (W, F) – ancora view, nessuna copia grande
+        yw = self.y_fin[k]           # scalar
+
+        # normalizzazione on-the-fly
+        if self.mu_x is not None and self.std_x is not None:
+            Xw = (Xw - self.mu_x) / self.std_x
+        if self.mu_y is not None and self.std_y is not None:
+            yw = (yw - self.mu_y) / self.std_y
+
+        # converte SOLO la finestra richiesta in tensor
+        return torch.from_numpy(np.asarray(Xw, dtype=np.float32)), torch.tensor(yw, dtype=torch.float32)

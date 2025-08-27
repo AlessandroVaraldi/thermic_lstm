@@ -1,0 +1,19 @@
+\section{Introduction}\label{sec:intro}
+Accurate knowledge of the semiconductor \emph{junction temperature} $T_\mathrm{j}$ is a cornerstone requirement for the safe, efficient and reliable operation of modern traction inverters used in battery-electric vehicles (BEVs) and industrial drives~\cite{Eleffendi2015}.  
+Exceeding the maximum allowed $T_\mathrm{j}$ accelerates wear-out mechanisms such as bond-wire lift-off and solder fatigue, ultimately shortening device lifetime and risking catastrophic failure~\cite{Abuelnaga2021}.  
+Conversely, conservative guard bands reduce exploitable current capability, hindering power-density targets and escalating cooling-system cost.
+
+Traditionally, $T_\mathrm{j}$ is inferred either from slow embedded sensors (thermocouples, on-chip diodes) or from real-time loss observers coupled with \emph{a-posteriori} thermal impedances. Such model-based approaches rely on fixed lumped-parameter networks whose parameters must be laboriously identified for each package variant and operating condition, and their linear structure struggles with strongly dynamic load profiles that induce steep temperature ramps on millisecond scales~\cite{Lim2021}.
+
+Data-driven regression has recently emerged as a flexible alternative: recurrent networks and temporal convolutions demonstrated superior accuracy on power-electronic temperature benchmarks~\cite{Kirchgässner2021}. However, purely data-driven models often over-fit catalog-specific duty cycles and may generate thermodynamically inconsistent predictions when extrapolated. Embedding physics within the learning objective has therefore become a promising strategy to combine accuracy with plausibility~\cite{Jia2019}.
+
+The present study proposes a physically consistent, resource-efficient observer for $T_\mathrm{j}$ reconstruction.  
+Our main contributions are:
+\begin{enumerate}
+  \item Formulation of junction-temperature reconstruction as sequence-to-scalar regression over 128-sample windows of power loss and base-plate temperature, processed by an attention-augmented LSTM containing only $\approx 1.3\,\text{k}$ parameters.
+  \item A dual physics-informed loss that enforces both steady-state and transient energy-balance constraints, guaranteeing consistency under static and rapidly varying loads.
+  \item Comprehensive evaluation on proprietary automotive drive cycles, including ablation studies, showing substantial accuracy gains over data-driven and grey-box baselines.
+\end{enumerate}
+
+\vspace{2pt}
+The remainder of the paper is organized as follows: Section~\ref{sec:background} reviews the technical context; Section~\ref{sec:methodology} details the proposed model, loss and training procedure; Section~\ref{sec:results} reports experimental results; and Section~\ref{sec:conclusion} concludes with outlooks toward deployment and generalization.

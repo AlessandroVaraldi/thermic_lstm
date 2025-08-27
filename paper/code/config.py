@@ -19,14 +19,14 @@ PLOT_PATH = "plots/"  # str
 
 # Resolution of the plots saved in `PLOT_PATH`. The resolution is
 # specified as a dpi value, which is the number of pixels per inch.
-PLOT_DPI = 300  # int
+PLOT_DPI = 3000  # int
 
 # --------------------------------------------------------------------
 # Data-set parameters
 # --------------------------------------------------------------------
 # Length (in time-steps) of each sliding window fed to the LSTM. A
-# window of 64 samples roughly corresponds to ~6 seconds of data.
-WINDOW_SIZE = 64  # int
+# window of 128 samples roughly corresponds to ~12 seconds of data.
+WINDOW_SIZE = 128  # int
 
 # Fractions used to split *time-ordered* data into train/val/test. The
 # remaining 10 % (1 - TRAIN_RATIO - VAL_RATIO) is implicitly the test
@@ -70,7 +70,6 @@ LAMBDA_WARMUP_EPOCHS = 10  # int ≥ 0
 # --------------------------------------------------------------------
 SEED          = 97     # int – global random seed for reproducibility
 MAX_EPOCHS    = 1000   # int – upper bound on training epochs
-EPOCHS        = 100
 PATIENCE      = 10     # int – early-stopping patience on validation loss
 BATCH_SIZE    = 8      # int – number of windows per mini-batch
 LEARNING_RATE = 1e-4   # float – initial LR for the Adam optimiser
@@ -99,7 +98,7 @@ DT = 1e-2         # float (seconds)
 # --------------------------------------------------------------------
 # Number of *additional* synthetic duty-cycles generated via simple
 # noise & scaling tricks defined in `data_utils.augment_cycle()`.
-AUG_CYCLES = 2   # int ≥ 0
+AUG_CYCLES = 5   # int ≥ 0
 
 # Fractions used when splitting *cycles* (as opposed to individual
 # samples) into train/val/test datasets after augmentation.

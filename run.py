@@ -123,6 +123,8 @@ def main():
     plt.tight_layout()
     plt.savefig(os.path.join(Path(PLOT_PATH), "signals.png"), dpi=300)
 
+    exit()
+
     # -------------------------------------------------------------- dataset/dataloader
     X_train_raw = np.column_stack([P_train, Tbp_train])
 

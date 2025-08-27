@@ -1,0 +1,44 @@
+\section{Background}\label{sec:background}
+This section motivates real-time junction-temperature estimation, surveys conventional techniques and recent neural approaches, and summarizes the position of the present work within that landscape.
+
+\subsection{Why Reconstruct the Junction Temperature?}\label{ssec:why}
+The silicon junction temperature $T_\mathrm{j}$ is the highest temperature inside a power device and therefore the dominant reliability driver.  
+If $T_\mathrm{j}$ exceeds its limit even briefly, bond wires may lift off, solder layers crack and thermo-mechanical fatigue accelerates.  
+When operation is too conservative, cooling resources are wasted and power density suffers.  
+Accurate real-time knowledge of $T_\mathrm{j}$ therefore enables:
+\begin{itemize}
+  \item \emph{Dynamic thermal derating} – the inverter can deliver more current when the chip is cool and gently reduce output only when headroom shrinks;
+  \item \emph{Remaining-life estimation} – lifetime-consumption models integrate the actual junction-temperature swing, not the case or ambient temperature;
+  \item \emph{Design optimization} – precise temperature feedback permits smaller heatsinks, pumps and coolant flow.
+\end{itemize}
+
+\subsection{Conventional Estimation Techniques}\label{ssec:related_work}
+\begin{itemize}
+  \item \emph{Direct sensing.}  Thermocouples or on-chip diodes measure temperature but are slow ($\gtrsim\!1$\,ms) and often placed away from the hotspot.  
+  \item \emph{Observer models.}  Industrial drives typically embed a lumped RC network driven by online loss estimates; parameters are extracted from step-response experiments and cannot adapt to ageing or mounting tolerances.  
+  \item \emph{Kalman and sliding-mode observers.}  Stochastic and sliding-mode filters reduce noise but remain limited by the fidelity of the gray-box thermal model they build upon~\cite{Han2018}.
+\end{itemize}
+
+\subsection{Neural Networks, LSTM and Attention}\label{ssec:nn_background}
+An \emph{artificial neuron} applies a linear transform followed by a non-linear activation.  
+Stacking many neurons yields a feed-forward neural network (FNN) that approximates complex, high-dimensional mappings.  
+Training minimizes a loss between network output and target via gradient descent and back-propagation of derivatives.
+
+FNNs, however, ignore temporal context because they treat each input independently.  
+\emph{Recurrent neural networks} (RNNs) introduce a hidden state that evolves with time, endowing the model with memory.  
+Vanilla RNNs suffer from vanishing or exploding gradients on long sequences; the \emph{Long Short-Term Memory} (LSTM) cell mitigates this problem by gating information flow through \emph{input}, \emph{forget} and \emph{output} gates, and by maintaining a separate cell state that can carry information almost unchanged across many time steps~\cite{Hochreiter1997}.  
+LSTMs therefore underpin most sequence-modeling applications in speech, text and sensor time-series data.
+
+Although LSTMs capture long-range dependencies, they compress the entire history into a single hidden vector.  
+\emph{Attention mechanisms} alleviate this bottleneck by allowing the network to compute a context-dependent weighted sum over all hidden states, effectively letting the model decide \emph{which} past instants are most relevant to the current prediction.  
+Originally introduced in neural machine translation~\cite{Bahdanau2016}, attention layers have since been combined with LSTMs in numerous time-series tasks, yielding improved performance and interpretability~\cite{Qin2017}.
+
+\subsection{Physics-informed Neural Networks}\label{ssec:pinn_background}
+Purely data-driven models can fit nonphysical functions if over-parameterized.  Physics-informed neural networks (PINNs) embed the governing equations in the loss:
+\[
+\mathcal L
+=\underbrace{\mathrm{MSE}\bigl(T_\text{pred},T_\text{meas}\bigr)}_{\text{data term}}
++\lambda\,
+ \underbrace{\mathrm{MSE}\!\bigl(\mathcal F(T_\text{pred},\dot T_\text{pred},\mathbf u),0\bigr)}_{\text{physics term}},
+\]
+where $\mathcal F(\cdot)=0$ represents the physical law, and $\lambda$ balances data versus physics~\cite{Raissi2019}.  Benefits include better extrapolation, data efficiency and interpretability, but determining the right scaling between loss components remains challenging.

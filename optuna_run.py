@@ -1,26 +1,30 @@
-# ---------------------------------------------------------------------
-# 1. Standard libraries
-# ---------------------------------------------------------------------
+# ============================================================================
+# 1. Standard library imports
+# ============================================================================
 import argparse
 import logging
+import math
 import os
 import time
+from functools import partial
 from pathlib import Path
 
-# ---------------------------------------------------------------------
-# 2. Third-party libraries
-# ---------------------------------------------------------------------
+# ============================================================================
+# 2. Third-party imports
+# ============================================================================
 import numpy as np
 import matplotlib.pyplot as plt
+import requests                           # Telegram API
 import torch
 from torch.utils.data import ConcatDataset, DataLoader
 
-import requests  # ← new
+# Optional: AMP and profiling tools
+from torch.amp import GradScaler, autocast
 
 try:
     import optuna
 except ImportError as e:
-    raise ImportError("Optuna not found - install with `pip install optuna`") from e
+    raise ImportError("Optuna not found – install with `pip install optuna`") from e
 
 try:
     from thop import profile
@@ -28,23 +32,49 @@ try:
 except ImportError:
     THOP_AVAILABLE = False
 
-# ---------------------------------------------------------------------
-# 3. Local modules
-# ---------------------------------------------------------------------
-from src.config import *                     # global project settings
+# ============================================================================
+# 3. Project-local imports
+# ============================================================================
+from src.config import *  # global settings like SEED, BATCH_SIZE, etc.
 from src.data_utils import (
-    load_csv, compute_powers, augment_cycle, seed_everything,
+    load_all_csvs, compute_powers, augment_cycle, seed_everything,
     solve_reference_ode, sliding_windows, predict_mc
 )
 from src.dataset import WindowDataset
 from src.models import LSTMModel
 from src.train import train_model
 
+import importlib  # used for runtime config updates
+
+
+CKPT_DIR = Path("checkpoints")
+CKPT_DIR.mkdir(exist_ok=True)
+
+# ---------------- metriche addizionali ---------------------------------
+def mae(y_pred, y_true):
+    return float(np.mean(np.abs(y_pred - y_true)))
+
+def huber(y_pred, y_true, delta=1.0):
+    err  = y_pred - y_true
+    mask = np.abs(err) <= delta
+    return float(
+        np.mean(0.5 * err[mask]**2) +               # parte quadratica
+        np.mean(delta * (np.abs(err[~mask]) - 0.5*delta))  # parte lineare
+    )
+
+def gaussian_nll(mu, sigma, y_true, eps=1e-6):
+    """
+    Neg-log-likelihood per predizioni normal-Gaussian:
+        NLL = 0.5·log(2πσ²) + 0.5·((y-μ)/σ)²
+    """
+    sigma = np.clip(sigma, eps, None)
+    return float(np.mean(
+        0.5 * np.log(2 * math.pi * sigma**2) +
+        0.5 * ((y_true - mu) / sigma)**2
+    ))
+
 # ---------------------------------------------------------------------
-# 4. Logging helpers
-# ---------------------------------------------------------------------
-# ---------------------------------------------------------------------
-# 4. Logging helpers
+# 4. Logging helpers (unchanged)
 # ---------------------------------------------------------------------
 def setup_logging(verbose: bool, log_dir: str = "logs") -> logging.Logger:
     """
@@ -58,7 +88,6 @@ def setup_logging(verbose: bool, log_dir: str = "logs") -> logging.Logger:
     logger = logging.getLogger()          # root logger
     logger.setLevel(logging.INFO)
 
-    # -------- NEW: remove any handler that was already attached
     for h in logger.handlers[:]:
         logger.removeHandler(h)
 
@@ -72,19 +101,19 @@ def setup_logging(verbose: bool, log_dir: str = "logs") -> logging.Logger:
     logger.addHandler(fh)
 
     if verbose:
-        ch = logging.StreamHandler()      # single console handler
+        ch = logging.StreamHandler()
         ch.setFormatter(formatter)
         logger.addHandler(ch)
 
-    logger.info("Logger initialised - log file: %s", log_path)
+    logger.info("Logger initialised – log file: %s", log_path)
     return logger
 
 
 # ---------------------------------------------------------------------
-# 5. Utility functions (unchanged except for logging)
+# 5. Utility functions (unchanged)
 # ---------------------------------------------------------------------
 def predict(model, dl, device):
-    """Forward pass over a DataLoader - returns stacked numpy arrays."""
+    """Forward pass over a DataLoader – returns stacked numpy arrays."""
     model.eval()
     preds, gts = [], []
     with torch.no_grad():
@@ -115,7 +144,7 @@ def build_concat_dataset(
 
 
 # ---------------------------------------------------------------------
-# 6. Telegram helpers
+# 6. Telegram helpers (unchanged)
 # ---------------------------------------------------------------------
 def send_telegram_message(
     text: str,
@@ -125,37 +154,23 @@ def send_telegram_message(
 ) -> bool:
     """
     Push a message to Telegram via Bot API.
-
-    Parameters
-    ----------
-    text : str
-        Message body (supports Markdown / HTML depending on `parse_mode`).
-    bot_token : str | None
-        Your bot token (fallback to env var TELEGRAM_BOT_TOKEN).
-    chat_id : str | None
-        Destination chat ID (fallback to env var TELEGRAM_CHAT_ID).
-    parse_mode : str
-        'Markdown', 'MarkdownV2' or 'HTML'.
-
-    Returns
-    -------
-    bool
-        True on success, False otherwise (errors are logged).
     """
     bot_token = bot_token or os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id   = chat_id   or os.getenv("TELEGRAM_CHAT_ID")
 
     if not bot_token or not chat_id:
-        logging.warning("Telegram token / chat_id missing - notification skipped")
+        logging.warning("Telegram token / chat_id missing – notification skipped")
         return False
 
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {
         "chat_id": chat_id,
         "text": text,
-        "parse_mode": parse_mode,
         "disable_web_page_preview": True,
     }
+
+    if parse_mode is not None:
+        payload["parse_mode"] = parse_mode
 
     try:
         r = requests.post(url, data=payload, timeout=10)
@@ -170,7 +185,26 @@ def send_telegram_message(
 # ---------------------------------------------------------------------
 # 7. Main pipeline
 # ---------------------------------------------------------------------
-def main(n_trials: int, verbose: bool, device: str = "cuda", use_amp: bool = True, use_telegram: bool = True):
+def main(
+    n_trials: int,
+    verbose: bool,
+    device: str = "cuda",
+    use_amp: bool = True,
+    use_telegram: bool = True,
+    # -----------------------------------------------------------------
+    # new switches for the first (architecture) search
+    # -----------------------------------------------------------------
+    search_hidden: bool = True,
+    search_layers: bool = True,
+    search_lr: bool = True,
+    search_ss: bool = True,
+    search_tr: bool = True,
+    fixed_hidden: int = 16,
+    fixed_layers: int = 1,
+    fixed_lr: float | None = None,
+    fixed_ss: float | None = None,
+    fixed_tr: float | None = None
+):
 
     if use_telegram:
         send_telegram_message(
@@ -184,32 +218,43 @@ def main(n_trials: int, verbose: bool, device: str = "cuda", use_amp: bool = Tru
     seed_everything(SEED)
     logger.info("Random seed set to %s", SEED)
 
-    # -------------------------------------------------- Data loading
-    cols   = load_csv()
-    P_orig = compute_powers(cols["Id"], cols["Iq"])
+    # -------------------------------------------------- Data loading – MULTI-CSV
+    datasets = load_all_csvs()
+    if len(datasets) == 0:
+        raise RuntimeError("Nessun CSV trovato – controlla CSV_DIR / CSV_GLOB")
 
-    t_base     = cols["t"]
-    dt         = t_base[1] - t_base[0]
-    # expose dt to the training loop via the global config
-    import importlib; importlib.import_module("src.config").DT = float(dt)
-    cycle_span = t_base[-1] - t_base[0]
-    logger.info("Loaded dataset - base cycle length: %.3f s, dt: %.6f s", cycle_span, dt)
-
-    # ----------- Original + augmented duty-cycles
     cycles_t, cycles_P, cycles_Tbp, cycles_Tjr = [], [], [], []
-    cycles_t  .append(t_base.copy())
-    cycles_P  .append(P_orig.copy())
-    cycles_Tbp.append(cols["Tbp"].copy())
-    cycles_Tjr.append(cols["Tjr"].copy())
 
-    for i in range(AUG_CYCLES):
-        P_aug, Tbp_aug, Tjr_aug = augment_cycle(P_orig, cols["Tbp"], cols["Tjr"])
-        t_shift = (i + 1) * (cycle_span + dt)
-        cycles_t  .append(t_base + t_shift)
-        cycles_P  .append(P_aug)
-        cycles_Tbp.append(Tbp_aug)
-        cycles_Tjr.append(Tjr_aug)
-    logger.info("Augmented %d additional cycles (total = %d)", AUG_CYCLES, len(cycles_t))
+    # --- dt globale preso dal *primo* file (asseriamo che tutti i CSV abbiano stesso sampling)
+    dt = datasets[0]["t"][1] - datasets[0]["t"][0]
+    
+    importlib.import_module("src.config").DT = float(dt)
+    logger.info("Found %d CSV files – global dt = %.6f s", len(datasets), dt)
+
+    for data_idx, cols in enumerate(datasets):
+        P_orig      = compute_powers(cols["Id"], cols["Iq"])
+        t_base      = cols["t"]
+        cycle_span  = t_base[-1] - t_base[0]
+
+        # -------- ciclo reale
+        cycles_t  .append(t_base.copy())
+        cycles_P  .append(P_orig.copy())
+        cycles_Tbp.append(cols["Tbp"].copy())
+        cycles_Tjr.append(cols["Tjr"].copy())
+
+        # -------- augmentation sul singolo file
+        for i in range(AUG_CYCLES):
+            P_aug, Tbp_aug, Tjr_aug = augment_cycle(P_orig, cols["Tbp"], cols["Tjr"])
+            t_shift = (i + 1) * (cycle_span + dt)
+            cycles_t .append(t_base + t_shift)
+            cycles_P .append(P_aug)
+            cycles_Tbp.append(Tbp_aug)
+            cycles_Tjr.append(Tjr_aug)
+
+    logger.info(
+        "Generated %d cycles (%d real + %d augmented)",
+        len(cycles_t), len(datasets), len(cycles_t) - len(datasets)
+    )
 
     n_cycles = len(cycles_t)
     n_train  = int(TRAIN_FRAC * n_cycles)
@@ -221,7 +266,7 @@ def main(n_trials: int, verbose: bool, device: str = "cuda", use_amp: bool = Tru
 
     PAD = WINDOW_SIZE - 1  # pad between cycles when concatenating
 
-    # ----------- Flattened (train/val/test) signals - needed for μ/σ
+    # Flattened signals (needed for μ/σ)
     P_train  = concat_with_pad([cycles_P[i]   for i in idx_train], PAD)
     Tbp_train = concat_with_pad([cycles_Tbp[i] for i in idx_train], PAD)
 
@@ -232,7 +277,7 @@ def main(n_trials: int, verbose: bool, device: str = "cuda", use_amp: bool = Tru
     mu_y, std_y = np.nanmean(Tjr_train), np.nanstd(Tjr_train)
     logger.info("Computed normalisation statistics")
 
-    # ----------- Datasets / DataLoaders
+    # Datasets / DataLoaders
     ds_train = build_concat_dataset(
         idx_train, cycles_P, cycles_Tbp, cycles_Tjr,
         mu_x, std_x, mu_y, std_y
@@ -252,120 +297,266 @@ def main(n_trials: int, verbose: bool, device: str = "cuda", use_amp: bool = Tru
 
     logger.info("Using device: %s", device)
 
-    # -------------------------------------------------- Optuna studies
-    # 1) Architecture + learning-rate search
-    logger.info("Starting architecture + LR tuning (%d trials)…", n_trials)
+    # -------------------------------------------------- 7.1 Optuna studies
+    # ---------------------------------------------------------------------
+    # 1) Architecture + (optional) learning-rate search
+    # ---------------------------------------------------------------------
 
-    def objective_arch(trial: optuna.Trial):
-        hidden_size = trial.suggest_int("hidden_size", 8, 32, step=8)
-        num_layers  = trial.suggest_int("num_layers", 1, 3)
-        lr          = trial.suggest_float("lr", 1e-4, 1e-2, log=True)
-        lambda_ss = 0.0  # fixed during first phase
-        lambda_tr = 0.0  # fixed during first phase
-
-        import importlib
-        importlib.import_module("src.config").LEARNING_RATE = lr
-
-        model = LSTMModel(INPUT_SIZE, hidden_size, num_layers).to(device)
-        model = train_model(model, dl_train, dl_val, lambda_ss=lambda_ss, lambda_tr=lambda_tr, device=device, use_amp=use_amp, logger=logger)
-
-        yh_val, y_val = predict(model, dl_val, device)
-        yh_val = mu_y + std_y * yh_val
-        y_val  = mu_y + std_y * y_val
-        return np.mean((yh_val - y_val) ** 2)
-
-    study_arch = optuna.create_study(
-        direction="minimize",
-        pruner=optuna.pruners.MedianPruner(n_startup_trials=5),
-        study_name="lstm_arch"
-    )
-    study_arch.optimize(objective_arch, n_trials=n_trials, callbacks=[
-        lambda study, trial: send_telegram_message(
-            f"Trial {trial.number} completed: {trial.value:.3e}",
-            parse_mode=None
+    any_param_search = search_hidden or search_layers or search_lr or search_ss or search_tr
+    if any_param_search:
+        logger.info(
+            "Starting architecture + LR tuning – searching: hidden=%s, layers=%s, lr=%s, ss=%s, tr=%s",
+            search_hidden, search_layers, search_lr, search_ss, search_tr
         )
-    ])
 
-    best_arch = study_arch.best_params
-    best_arch["lambda_ss"] = 0.0
-    best_arch["lambda_tr"] = 0.0
-    logger.info("Best architecture: %s", best_arch)
+        def objective_arch(trial: optuna.Trial):
+            # choose or fix each parameter
+            hidden_size = trial.suggest_int("hidden_size", 8, 32, step=8) if search_hidden else fixed_hidden
+            num_layers  = trial.suggest_int("num_layers", 1, 3)           if search_layers else fixed_layers
+            lr          = trial.suggest_float("lr", 1e-4, 1e-2, log=True) if search_lr else (fixed_lr or LEARNING_RATE)
+            lambda_ss   = 0.0
+            lambda_tr   = 0.0
 
-    # 2) Lambda_phys search
-    logger.info("Starting lambda tuning (%d trials)…", n_trials)
+            importlib.import_module("src.config").LEARNING_RATE = lr
 
-    import gc
-    def objective_lambda(trial):
-        try:
-            lambda_ss = trial.suggest_float("lambda_ss", 1e-6, 1e-2, log=True)
-            lambda_tr = trial.suggest_float("lambda_tr", 1e-6, 1e-2, log=True)
-
-            model = LSTMModel(INPUT_SIZE,
-                            best_arch["hidden_size"],
-                            best_arch["num_layers"]).to(device)
-            model = train_model(model, dl_train, dl_val,
-                                lambda_ss=lambda_ss,
-                                lambda_tr=lambda_tr,
-                                device=device)
+            model = LSTMModel(INPUT_SIZE, hidden_size, num_layers).to(device)
+            model = train_model(
+                model, dl_train, dl_val,
+                lambda_ss=lambda_ss, lambda_tr=lambda_tr,
+                device=device, use_amp=use_amp, logger=logger
+            )
 
             yh_val, y_val = predict(model, dl_val, device)
             yh_val = mu_y + std_y * yh_val
             y_val  = mu_y + std_y * y_val
+            val_mse = float(np.mean((yh_val - y_val) ** 2))
+
+            # --------------- checkpoint --------------------------
+            study_name = trial.study.study_name        # "lstm_arch"
+            ckpt_path  = CKPT_DIR / f"{study_name}_best.pt"
+
+            # NB: study.best_value è None finché non esiste un best
+            if (trial.number == 0) or (val_mse < trial.study.best_value):
+                torch.save(model.state_dict(), ckpt_path)
+                trial.set_user_attr("ckpt_path", str(ckpt_path))
+
             return float(np.mean((yh_val - y_val) ** 2))
 
-        except RuntimeError as e:
-            # graceful handling of CUDA OOM
-            if "out of memory" in str(e).lower():
-                torch.cuda.empty_cache()
-                gc.collect()
-                raise optuna.TrialPruned()    # segnala ad Optuna di scartare il trial
-            raise
-        finally:
-            del model
-            torch.cuda.empty_cache()
-            gc.collect()
-
-    study_lambda = optuna.create_study(
-        direction="minimize",
-        pruner=optuna.pruners.MedianPruner(n_startup_trials=5),
-        study_name="lstm_lambda"
-    )
-    study_lambda.optimize(objective_lambda, n_trials=n_trials, callbacks=[
-        lambda study, trial: send_telegram_message(
-            f"Trial {trial.number} completed: {trial.value:.3e}",
-            parse_mode=None
+        study_arch = optuna.create_study(
+            direction="minimize",
+            pruner=optuna.pruners.MedianPruner(n_startup_trials=5),
+            study_name="lstm_std"
         )
-    ])
+        study_arch.optimize(
+            objective_arch,
+            n_trials=n_trials,
+            callbacks=[lambda s, t: send_telegram_message(f"Arch trial {t.number}: {t.value:.3e}", parse_mode=None)]
+        )
 
-    best_pi_params = {**best_arch, "lambda_ss": study_lambda.best_params["lambda_ss"], "lambda_tr": study_lambda.best_params["lambda_tr"]}
-    logger.info("Best lambda parameters: %s", best_pi_params)
+        best_arch = study_arch.best_params
+        # Fill in fixed values for parameters not searched
+        if not search_hidden:
+            best_arch["hidden_size"] = fixed_hidden
+        if not search_layers:
+            best_arch["num_layers"] = fixed_layers
+        if not search_lr:
+            best_arch["lr"] = fixed_lr or LEARNING_RATE
+        if not search_ss:
+            best_arch["lambda_ss"] = fixed_ss if fixed_ss is not None else 0.0
+        if not search_tr:
+            best_arch["lambda_tr"] = fixed_tr if fixed_tr is not None else 0.0
 
-    # -------------------------------------------------- Retrain best models
-    def build_model_from_params(params):
-        import importlib
+    else:
+        # No search: just use the fixed values directly
+        best_arch = dict(hidden_size=fixed_hidden,
+                         num_layers=fixed_layers,
+                         lr=fixed_lr or LEARNING_RATE,
+                         lambda_ss=fixed_ss if fixed_ss is not None else 0.0,
+                         lambda_tr=fixed_tr if fixed_tr is not None else 0.0)
+        logger.info("No architecture tuning requested – using %s", best_arch)
+
+    logger.info("Best architecture (pre-PI): %s", best_arch)
+
+    # ---------------------------------------------------------------------
+    # 2) λ_ss search (λ_tr = 0)
+    # -----------------------------------------
+    if best_arch.get("lambda_ss") is not None:
+        logger.info("λ_ss is fixed to %.3e – skipping λ_ss search", best_arch["lambda_ss"])
+        best_lambda_ss = best_arch["lambda_ss"]
+
+    else:
+        logger.info("Starting λ_ss tuning (%d trials)…", n_trials)
+
+        import gc
+        def objective_lambda_ss(trial: optuna.Trial):
+            try:
+                lambda_ss = trial.suggest_float("lambda_ss", 1e-7, 1e-5, log=True)
+                lambda_tr = 0.0
+
+                model = LSTMModel(
+                    INPUT_SIZE,
+                    best_arch["hidden_size"],
+                    best_arch["num_layers"]
+                ).to(device)
+                model = train_model(
+                    model, dl_train, dl_val,
+                    lambda_ss=lambda_ss, lambda_tr=lambda_tr,
+                    device=device
+                )
+
+                yh_val, y_val = predict(model, dl_val, device)
+                yh_val = mu_y + std_y * yh_val
+                y_val  = mu_y + std_y * y_val
+                val_mse = float(np.mean((yh_val - y_val) ** 2))
+
+                # --------------- checkpoint --------------------------
+                study_name = trial.study.study_name        # "lstm_arch"
+                ckpt_path  = CKPT_DIR / f"{study_name}_best.pt"
+
+                # NB: study.best_value è None finché non esiste un best
+                if (trial.number == 0) or (val_mse < trial.study.best_value):
+                    torch.save(model.state_dict(), ckpt_path)
+                    trial.set_user_attr("ckpt_path", str(ckpt_path))
+
+                return float(np.mean((yh_val - y_val) ** 2))
+
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    torch.cuda.empty_cache(); gc.collect()
+                    raise optuna.TrialPruned()
+                raise
+            finally:
+                del model
+                torch.cuda.empty_cache(); gc.collect()
+
+        study_lambda_ss = optuna.create_study(
+            direction="minimize",
+            pruner=optuna.pruners.MedianPruner(n_startup_trials=5),
+            study_name="lstm_pi"
+        )
+        study_lambda_ss.optimize(
+            objective_lambda_ss,
+            n_trials=n_trials,
+            callbacks=[lambda s, t: send_telegram_message(f"λ_ss trial {t.number}: {t.value:.3e}", parse_mode=None)]
+        )
+        best_lambda_ss = study_lambda_ss.best_params["lambda_ss"]
+
+    # ---------------------------------------------------------------------
+    # 3) λ_tr search (λ_ss fixed al migliore)
+    # ---------------------------------------------------------------------
+    if best_arch.get("lambda_tr") is not None:
+        logger.info("λ_tr is fixed to %.3e – skipping λ_tr search", best_arch["lambda_tr"])
+        best_lambda_tr = best_arch["lambda_tr"]
+
+    else:
+        logger.info("Starting λ_tr tuning (%d trials)…", n_trials)
+
+        def objective_lambda_tr(trial: optuna.Trial):
+            try:
+                lambda_ss = best_lambda_ss
+                lambda_tr = trial.suggest_float("lambda_tr", 1e-7, 1e-5, log=True)
+
+                model = LSTMModel(
+                    INPUT_SIZE,
+                    best_arch["hidden_size"],
+                    best_arch["num_layers"]
+                ).to(device)
+                model = train_model(
+                    model, dl_train, dl_val,
+                    lambda_ss=lambda_ss, lambda_tr=lambda_tr,
+                    device=device
+                )
+
+                yh_val, y_val = predict(model, dl_val, device)
+                yh_val = mu_y + std_y * yh_val
+                y_val  = mu_y + std_y * y_val
+                val_mse = float(np.mean((yh_val - y_val) ** 2))
+
+                # --------------- checkpoint --------------------------
+                study_name = trial.study.study_name        # "lstm_arch"
+                ckpt_path  = CKPT_DIR / f"{study_name}_best.pt"
+
+                # NB: study.best_value è None finché non esiste un best
+                if (trial.number == 0) or (val_mse < trial.study.best_value):
+                    torch.save(model.state_dict(), ckpt_path)
+                    trial.set_user_attr("ckpt_path", str(ckpt_path))
+
+                return float(np.mean((yh_val - y_val) ** 2))
+
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    torch.cuda.empty_cache(); gc.collect()
+                    raise optuna.TrialPruned()
+                raise
+            finally:
+                del model
+                torch.cuda.empty_cache(); gc.collect()
+
+        study_lambda_tr = optuna.create_study(
+            direction="minimize",
+            pruner=optuna.pruners.MedianPruner(n_startup_trials=5),
+            study_name="lstm_lambda_tr"
+        )
+        study_lambda_tr.optimize(
+            objective_lambda_tr,
+            n_trials=n_trials,
+            callbacks=[lambda s, t: send_telegram_message(f"λ_tr trial {t.number}: {t.value:.3e}", parse_mode=None)]
+        )
+        best_lambda_tr = study_lambda_tr.best_params["lambda_tr"]
+
+    best_pi_params = {
+        **best_arch,
+        "lambda_ss": best_lambda_ss,
+        "lambda_tr": best_lambda_tr
+    }
+    logger.info("Best PI parameters: %s", best_pi_params)
+
+    # ---------------------------------------------------------------------
+    # 4) Retrain best models (unchanged)
+    # ---------------------------------------------------------------------
+    def build_model_from_params(params, ckpt_tag):
         cfg = importlib.import_module("src.config")
         cfg.LEARNING_RATE = params["lr"]
 
-        model = LSTMModel(
-            INPUT_SIZE,
-            params["hidden_size"],
-            params["num_layers"]
-        ).to(device)
+        model = LSTMModel(INPUT_SIZE,
+                        params["hidden_size"],
+                        params["num_layers"]).to(device)
 
-        return train_model(
+        # ---- se esiste un checkpoint salvato prima, riparti da lì
+        ckpt_file = CKPT_DIR / f"{ckpt_tag}_best.pt"
+        if ckpt_file.exists():
+            model.load_state_dict(torch.load(ckpt_file, map_location=device))
+            logger.info("Loaded checkpoint %s", ckpt_file)
+        else:
+            logger.info("No checkpoint %s – training from scratch", ckpt_file)
+
+        model = train_model(
             model, dl_train, dl_val,
             lambda_ss=params["lambda_ss"],
             lambda_tr=params["lambda_tr"],
-            device=device
+            device=device,
+            warmup_epochs=0 if not search_ss and not search_tr else LAMBDA_WARMUP_EPOCHS,
         )
 
+        final_ckpt = CKPT_DIR / f"{ckpt_tag}_final.pt"
+        torch.save(model, final_ckpt)
+
+        return model
+
     logger.info("Retraining best standard LSTM")
-    model_std = build_model_from_params(best_arch)
+    model_std = build_model_from_params(best_arch, "lstm_std")
 
     logger.info("Retraining best PI-LSTM")
-    model_pi  = build_model_from_params(best_pi_params)
+    model_pi  = build_model_from_params(best_pi_params, "lstm_pi")
 
-    # FLOPs + param counts
+    import json, pathlib
+    with open(pathlib.Path("checkpoints/") / "best_params.json", "w") as f:
+        json.dump({
+            "std": best_arch,
+            "pi": best_pi_params
+        }, f, indent=4)
+
+    # FLOPs + param counts (unchanged)
     if THOP_AVAILABLE:
         dummy = torch.randn(1, WINDOW_SIZE, INPUT_SIZE).to(device)
         flops_std, params_std = profile(model_std, inputs=(dummy,), verbose=False)
@@ -375,7 +566,9 @@ def main(n_trials: int, verbose: bool, device: str = "cuda", use_amp: bool = Tru
     else:
         logger.info("Install `thop` to measure FLOPs.")
 
-    # -------------------------------------------------- ODE reference (test set only)
+    # ---------------------------------------------------------------------
+    # 5) ODE reference (unchanged)
+    # ---------------------------------------------------------------------
     logger.info("Integrating ODE on each test cycle…")
     T_ode_list, ode_time_tot = [], 0.0
     for i in idx_test:
@@ -387,7 +580,9 @@ def main(n_trials: int, verbose: bool, device: str = "cuda", use_amp: bool = Tru
     T_ode = concat_with_pad(T_ode_list, PAD)
     logger.info("ODE integration completed in %.2f s", ode_time_tot)
 
-    # -------------------------------------------------- Evaluation on test set
+    # ---------------------------------------------------------------------
+    # 6) Evaluation on test set + MC-Dropout (unchanged)
+    # ---------------------------------------------------------------------
     logger.info("Evaluating best models on the test set…")
     yhat_std_pt, y_gt = predict(model_std, dl_test, device)
     yhat_pi_pt,  _    = predict(model_pi,  dl_test, device)
@@ -411,13 +606,25 @@ def main(n_trials: int, verbose: bool, device: str = "cuda", use_amp: bool = Tru
                       (y_gt <= mu_std + 1.96*sig_std))
     cov_pi  = np.mean((y_gt >= mu_pi  - 1.96*sig_pi ) &
                       (y_gt <= mu_pi  + 1.96*sig_pi ))
+    
+    # ----- nuovi indicatori ----------------------------------------------
+    mae_std   = mae(mu_std, y_gt)
+    mae_pi    = mae(mu_pi,  y_gt)
 
-    logger.info("MSE - Standard LSTM : %.4f", mse_std)
-    logger.info("MSE - PI-LSTM       : %.4f", mse_pi)
-    logger.info("95 %% coverage - Std : %5.2f%%", 100*cov_std)
-    logger.info("95 %% coverage - PI  : %5.2f%%", 100*cov_pi)
+    huber_std = huber(mu_std, y_gt, delta=1.0)
+    huber_pi  = huber(mu_pi,  y_gt, delta=1.0)
 
-    # ------------- ODE error (aligned to ground truth & masked)
+    nll_std   = gaussian_nll(mu_std, sig_std, y_gt)
+    nll_pi    = gaussian_nll(mu_pi,  sig_pi,  y_gt)
+
+    logger.info("==== Test-set metrics ====")
+    logger.info("MSE   – Std : %.4f   | PI : %.4f", mse_std,  mse_pi )
+    logger.info("MAE   – Std : %.4f   | PI : %.4f", mae_std,  mae_pi )
+    logger.info("Huber – Std : %.4f   | PI : %.4f (δ=1°C)", huber_std, huber_pi)
+    logger.info("NLL   – Std : %.4f   | PI : %.4f", nll_std,  nll_pi )
+    logger.info("95 %% coverage – Std : %5.2f%% | PI : %5.2f%%", 100*cov_std, 100*cov_pi)
+
+    # ------------- ODE error (unchanged)
     start            = WINDOW_SIZE - 1
     t_full           = concat_with_pad([cycles_t[i] for i in idx_test], PAD)[start:]
     T_gt_full        = concat_with_pad([cycles_Tjr[i] for i in idx_test], PAD)[start:]
@@ -428,7 +635,7 @@ def main(n_trials: int, verbose: bool, device: str = "cuda", use_amp: bool = Tru
     T_ode_valid      = T_ode_full[mask_full]
     mse_ode          = np.mean((T_ode_valid - T_gt_valid) ** 2)
 
-    # ------------- Time stamps for NN predictions
+    # ------------- Time stamps for NN predictions (unchanged)
     t_pred_list = []
     for i in idx_test:
         t_cycle   = cycles_t[i]
@@ -440,13 +647,15 @@ def main(n_trials: int, verbose: bool, device: str = "cuda", use_amp: bool = Tru
         t_pred_list.append(t_end[mask])
     t_pred = np.concatenate(t_pred_list)
 
-    # -------------------------------------------------- Plots
+    # ---------------------------------------------------------------------
+    # 7) Plots (unchanged)
+    # ---------------------------------------------------------------------
     Path(PLOT_PATH).mkdir(parents=True, exist_ok=True)
 
     logger.info("Generating plots…")
     # 1) Temperature comparison
     plt.figure(figsize=(10, 4))
-    plt.title("Test set - Tj comparison (Optuna-tuned models)")
+    plt.title("Test set – Tj comparison (Optuna-tuned models)")
 
     plt.plot(t_valid, T_gt_valid,            label="Ground-truth Tj",  linewidth=1.5)
     plt.plot(t_valid, T_ode_valid, "--",     label="ODE (1-RC)",       linewidth=1)
@@ -472,7 +681,7 @@ def main(n_trials: int, verbose: bool, device: str = "cuda", use_amp: bool = Tru
 
     # 2) Error curves
     plt.figure(figsize=(10, 4))
-    plt.title("Error plots - ODE vs Optuna-tuned models")
+    plt.title("Error plots – ODE vs Optuna-tuned models")
 
     plt.plot(t_valid, T_ode_valid - T_gt_valid, label="ODE error",          linewidth=1)
     plt.plot(t_pred,  mu_std - y_gt,            label="Best LSTM error",    linewidth=1)
@@ -495,9 +704,11 @@ def main(n_trials: int, verbose: bool, device: str = "cuda", use_amp: bool = Tru
     plt.savefig(Path(PLOT_PATH) / "error_comparison_optuna.png", dpi=PLOT_DPI)
     plt.close()
 
-    logger.info("All done - plots saved in %s", PLOT_PATH)
+    logger.info("All done – plots saved in %s", PLOT_PATH)
 
-    # -------------------------------------------------- Telegram notification
+    # ---------------------------------------------------------------------
+    # 8) Telegram final notification (unchanged except for new params)
+    # ---------------------------------------------------------------------
     if use_telegram:
         msg_lines = [
             "*Optuna run finished*",
@@ -507,14 +718,21 @@ def main(n_trials: int, verbose: bool, device: str = "cuda", use_amp: bool = Tru
             f"- Hidden size   : {best_arch['hidden_size']}",
             f"- Num layers    : {best_arch['num_layers']}",
             f"- LR            : {best_arch['lr']:.3e}",
-            f"- λ_ss (PI)     : {best_pi_params['lambda_ss']:.3e}",
-            f"- λ_tr (PI)     : {best_pi_params['lambda_tr']:.3e}",
+            f"- λ_ss (PI)     : {best_lambda_ss:.3e}",
+            f"- λ_tr (PI)     : {best_lambda_tr:.3e}",
             "",
             "*Test metrics*",
-            f"- MSE LSTM      : {mse_std:.4f}",
-            f"- MSE PI-LSTM   : {mse_pi:.4f}",
-            f"- 95 % cov LSTM : {cov_std*100:.2f} %",
-            f"- 95 % cov PI   : {cov_pi*100:.2f} %",
+            f"- ODE MSE        : {mse_ode:.4f}",
+            f"- MSE (Std)      : {mse_std:.4f}",
+            f"- MSE (PI)       : {mse_pi:.4f}",
+            f"- MAE (Std)      : {mae_std:.4f}",
+            f"- MAE (PI)       : {mae_pi:.4f}",
+            f"- Huber (Std)    : {huber_std:.4f}",
+            f"- Huber (PI)     : {huber_pi:.4f}",
+            f"- NLL (Std)      : {nll_std:.4f}",
+            f"- NLL (PI)       : {nll_pi:.4f}",
+            f"- 95% Cov (Std)  : {100*cov_std:.2f}",
+            f"- 95% Cov (PI)   : {100*cov_pi:.2f}",
             "",
             "Plots saved in `plots/`."
         ]
@@ -522,36 +740,50 @@ def main(n_trials: int, verbose: bool, device: str = "cuda", use_amp: bool = Tru
 
 
 # ---------------------------------------------------------------------
-# 7. Entry point
+# 9. Entry point – new CLI switches
 # ---------------------------------------------------------------------
 if __name__ == "__main__":
     default_device = "cuda" if torch.cuda.is_available() else "cpu"
-    parser = argparse.ArgumentParser(description="LSTM training with Optuna")
-    parser.add_argument(
-        "--trials", type=int, default=30,
-        help="Number of Optuna trials per study (default: 30)"
-    )
-    parser.add_argument(
-        "--verbose", action="store_true",
-        help="Also print log messages to stdout"
-    )
-    parser.add_argument(
-        "--device", type=str, 
-        default=default_device,
-        choices=["cpu", "cuda"],
-        help="Device to use for training (default: 'cuda' if available, else 'cpu')"
-    )
-    parser.add_argument(
-        "--amp", action="store_true",
-        default=True,
-        help="Use automatic mixed precision (AMP) for training (default: True)"
-    )
-    parser.add_argument(
-        "--use-telegram", action="store_true",
-        default=False,
-        help="Send notifications to Telegram (default: True)"
-    )
-   
-    args = parser.parse_args()
-    main(n_trials=args.trials, verbose=args.verbose, device=args.device, use_amp=args.amp, use_telegram=args.use_telegram)
+    parser = argparse.ArgumentParser(description="LSTM training with Optuna – flexible search")
 
+    parser.add_argument("--trials", type=int, default=30, help="Number of Optuna trials per study (default: 30)")
+    parser.add_argument("--verbose", action="store_true", help="Also print log messages to stdout")
+    parser.add_argument("--device", type=str, default=default_device, choices=["cpu", "cuda"], help="Device to use for training (default: 'cuda' if available, else 'cpu')")
+    parser.add_argument("--amp", action="store_true", default=False, help="Use automatic mixed precision (default: False)")
+    parser.add_argument("--use-telegram", action="store_true", default=False, help="Send notifications to Telegram (default: False)")
+
+    # --- new search flags --------------------------------------------------
+    parser.add_argument("--no-hidden-search", action="store_true", help="Do NOT search hidden_size – keep it fixed")
+    parser.add_argument("--no-layers-search", action="store_true", help="Do NOT search num_layers – keep it fixed")
+    parser.add_argument("--no-lr-search", action="store_true", help="Do NOT search learning-rate – keep it fixed")
+    parser.add_argument("--no-ss-search", action="store_true", help="Do NOT search λ_ss – keep it fixed")
+    parser.add_argument("--no-tr-search", action="store_true", help="Do NOT search λ_tr – keep it fixed")
+
+    # Values to use when search is disabled
+    parser.add_argument("--hidden-size", type=int, default=16, help="Fixed hidden_size if search disabled (default: 16)")
+    parser.add_argument("--num-layers", type=int, default=1, help="Fixed num_layers if search disabled (default: 1)")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Fixed learning rate if search disabled (default: config value)")
+    parser.add_argument("--lambda-ss", type=float, default=9.7800629709722e-06, help="Fissa λ_ss e salta la sua ricerca se non è None")
+    parser.add_argument("--lambda-tr", type=float, default=2.1549713272239936e-06, help="Fissa λ_tr e salta la sua ricerca se non è None")
+
+    args = parser.parse_args()
+
+    #python optuna_run.py --trials 50 --verbose --use-telegram --no-hidden-search --no-layers-search --no-lr-search --no-ss-search --no-tr-search
+
+    main(
+        n_trials=args.trials,
+        verbose=args.verbose,
+        device=args.device,
+        use_amp=args.amp,
+        use_telegram=args.use_telegram,
+        search_hidden=not args.no_hidden_search,
+        search_layers=not args.no_layers_search,
+        search_lr=not args.no_lr_search,
+        search_ss=not args.no_ss_search,
+        search_tr=not args.no_tr_search,
+        fixed_hidden=args.hidden_size,
+        fixed_layers=args.num_layers,
+        fixed_lr=args.lr,
+        fixed_ss=args.lambda_ss,
+        fixed_tr=args.lambda_tr
+    )

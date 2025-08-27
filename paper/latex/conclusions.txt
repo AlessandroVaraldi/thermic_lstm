@@ -1,0 +1,16 @@
+\section{Conclusions and Outlook}\label{sec:conclusion}
+
+In this work, we presented a lightweight, attention-augmented, physics-informed LSTM neural observer enhanced by a single RC thermal model. The proposed architecture achieves an accuracy of approximately \SI{1.63}{\celsius} MAE on unseen drive cycles, while using only \SI{1313} parameters and \SI{1.8e5}{FLOPs} per inference window. This compact footprint is compatible with the constraints of modern automotive microcontrollers.
+
+However, deployment on extremely low-power microcontroller units (MCUs), such as ARM Cortex-M or RISC-V based devices, poses additional challenges due to strict constraints on computational resources, memory footprint, and power consumption.
+
+To enable practical deployment on these constrained MCUs, future work should realistically address advanced optimization techniques, specifically tailored for LSTM architectures:
+\begin{itemize}
+\item \textbf{Mixed-precision quantization:} Given the sensitivity of LSTM networks to numerical precision, especially in their internal cell and hidden states, a realistic strategy would involve quantizing weights and intermediate computations to INT8, while maintaining cell states, hidden states, and critical outputs in higher precision (e.g., INT16 or INT32) to prevent significant accuracy degradation.
+\item \textbf{Quantization-aware training (QAT):} Fine-tuning the LSTM model with quantization effects simulated during training is crucial. QAT enables the model to adapt to lower precision weights and activations while preserving predictive performance.
+\item \textbf{Gate-specific precision adjustment:} The sensitivity of LSTM gates (input, forget, cell, output) to reduced numerical precision varies significantly. A targeted, gate-specific quantization strategy can help balance accuracy and computational efficiency, such as higher precision (INT16 or INT32) for cell states and gate outputs, combined with INT8 precision for less sensitive computations like attention mechanisms.
+\end{itemize}
+
+Additional promising directions include structured pruning to remove redundant neurons and reduce complexity, and knowledge distillation to train smaller student networks that inherit performance from larger, physics-informed teacher models. Moreover, carefully optimized inference kernels for specific MCU architectures can further improve computational efficiency by minimizing memory accesses and reducing power consumption.
+
+By thoughtfully combining these optimization strategies, we aim to achieve robust, accurate, and energy-efficient thermal state estimation suitable for real-time deployment on highly constrained MCUs in safety-critical automotive applications.

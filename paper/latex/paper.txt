@@ -1,0 +1,87 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+% The preceding line is only needed to identify funding in the first footnote.
+% If that is unneeded, please comment it out.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Packages
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{mathtools}
+\usepackage{xcolor}
+\usepackage{lipsum} 
+\usepackage{booktabs}
+\usepackage[
+  backend=biber,
+  isbn=false,
+  doi=true,
+  url=false,
+  maxnames=6,
+  giveninits=true,
+  sorting=none
+]{biblatex}
+\usepackage{mdframed}
+
+\usepackage{siunitx}           % \SI{…}{\celsius}, \num{…}
+  \sisetup{detect-all}         % match surrounding font
+\usepackage{booktabs}          % \toprule, \midrule in tables
+\usepackage[inline]{enumitem}          % inline lists: enumerate*, itemize*
+  \setlist{nosep}              % compact spacing
+\usepackage{microtype}         % nicer kerning / protrusion (optional)
+
+\definecolor{codeBackground1}{RGB}{255, 229, 204}
+\definecolor{titleBackground1}{RGB}{255, 178, 102}
+
+\newcommand\tab[1][1cm]{\hspace*{#1}}
+
+\mdfdefinestyle{mdstyle}{
+  backgroundcolor=codeBackground1,
+  shadow=true,
+  shadowsize=2pt,
+  shadowcolor=black!30,
+  frametitlerule=true,
+  frametitlebackgroundcolor=titleBackground1,
+  align=center}
+
+\addbibresource{bibliography.bib}
+\AtBeginBibliography{\small}
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+  T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Authors
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\author{
+Alessandro Varaldi\IEEEauthorrefmark{1},
+Maurizio Tranchero\IEEEauthorrefmark{2},
+Lorenzo Giraudi\IEEEauthorrefmark{2},
+Claudio Genta\IEEEauthorrefmark{2},
+Marco Vacca\IEEEauthorrefmark{1}\\[2pt]
+\IEEEauthorrefmark{1}DET, Politecnico di Torino, Torino, Italy \\
+\IEEEauthorrefmark{2}Ideas \& Motion, Cherasco, Italy \\
+\{name.surname\}@polito.it, \{name.surname\}@ideasandmotion.com
+}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\begin{document}
+
+\title{Physics-Informed Attention-LSTM for Real-Time Junction-Temperature Estimation%
+\thanks{This work was funded by the PNRR-NGEU programme under MUR – DM 117/2023.}}
+\maketitle
+
+\input{sections/abstract}
+\input{sections/introduction}
+\input{sections/background}
+\input{sections/methodology}
+\input{sections/results}
+\input{sections/conclusions}
+
+\printbibliography
+\end{document}

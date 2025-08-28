@@ -1,0 +1,57 @@
+{
+  "qat": true,
+  "hidden": 16,
+  "layers": 1,
+  "dropout": 0.1,
+  "S_gate_q8": 32,
+  "S_tanhc_q8": 64,
+  "epochs": 1000,
+  "batch": 16,
+  "lr": 0.0001,
+  "lambda_ss": 9.78e-06,
+  "lambda_tr": 2.15e-06,
+  "warmup": 0,
+  "mu_x": [
+    0.9380356669425964,
+    58.469207763671875
+  ],
+  "std_x": [
+    6.266365051269531,
+    14.527019500732422
+  ],
+  "mu_y": 58.106170654296875,
+  "std_y": 19.529991149902344,
+  "splits": {
+    "train": [
+      7,
+      5,
+      3,
+      4,
+      1,
+      6
+    ],
+    "val": [
+      0
+    ],
+    "test": [
+      8,
+      2
+    ]
+  },
+  "metrics": {
+    "val_best_mse": 0.07692787750973347,
+    "test_mse": 0.06427605807650329,
+    "test_mae": 3.713170289993286,
+    "test_rmse": 4.951384518362681,
+    "test_r2": 0.9478845596313477
+  },
+  "amp": true,
+  "amp_dtype": "bf16",
+  "ckpt": false,
+  "ckpt_chunk": 16,
+  "tbptt_k": 0,
+  "accum": 2,
+  "val_interval": 1,
+  "val_max_batches": null,
+  "compile": 0
+}

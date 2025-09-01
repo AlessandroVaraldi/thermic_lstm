@@ -1,62 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-QAT training for integer-only Attention PI-LSTM — Overview (non-standard features)
+QAT training for integer-only Attention PI-LSTM — optimized & PI-consistent
 
-This script trains a physics-informed, quantization-aware LSTM for junction-temperature
-estimation, engineered for deployment realism and wall-clock efficiency.
+Novità principali di questa versione:
+  • Usa il dt **misurato dai CSV** per il residuo transiente (non il DT fisso).
+  • Mantiene il "single-pass twin-window" (ŷ_t e ŷ_{t-1} in un solo forward).
+  • AMP con dtype selezionabile (bf16|fp16), accumulo gradienti, TBPTT/ckpt opzionali.
+  • Validazione intermittenza + limite batch; DataLoader ottimizzati; torch.compile.
 
-Key contributions:
-
-1) Physics-informed objective aligned with deployment
-   • Transient residual enforced purely on predictions (T̂t-1, T̂t) — no teacher forcing.
-   • Terms computed in physical units (°C, W) via on-the-fly de-normalization.
-   • Linear warm-up of physics penalties (λss, λtr) to avoid early optimization conflicts.
-
-2) Integer-aware QAT details
-   • Task-specific INT8 scales exposed for sensitive blocks (gate pre-activations, tanh(c)):
-     S_gate_q8, S_tanhc_q8 improve post-quantization fidelity versus uniform scaling.
-
-3) Single-pass twin-window trick (compute T̂t and T̂t-1 in one forward)
-   • Builds a “shifted” window and concatenates on the batch to eliminate a second model pass.
-   • Cuts per-epoch time at small memory cost; compatible with grad accumulation.
-
-4) Capability-based memory/perf controls
-   • TBPTT and fine-grained activation checkpointing auto-enable if the model exposes
-     (use_ckpt, ckpt_chunk, tbptt_k); otherwise clean fallback to coarse/no-ckpt.
-   • AMP with dtype awareness: GradScaler enabled only for FP16 (not for BF16).
-   • Optional fused-Adam with transparent fallback; gradient clipping + accumulation.
-   • Optional torch.compile('reduce-overhead'); TF32 enabled on supported GPUs.
-
-5) Validation cost shaping & realistic splitting
-   • Interleaved/partial validation (val-interval, val-max-batches) to bound eval overhead.
-   • Cycle-level split (train/val/test) instead of window-level to prevent temporal leakage.
-   • Data pipeline tuned for throughput (pinned memory, persistent workers, prefetch).
-
-6) Reproducibility, reporting, and baselines
-   • Deterministic early stop with explicit best-weight snapshot.
-   • Metrics reported in physical units (MSE/MAE/RMSE/R² on °C) + loss curves.
-   • Physics ODE baseline computed with measured runtime for context.
-   • Full run provenance saved to checkpoints/meta_qat.json (all knobs & metrics).
-
-Artifacts
-  • checkpoints/{best_qat.pth, last_qat.pth}
-  • checkpoints/meta_qat.json
-  • plots/loss_curves_qat.png
-
-Example
-  # Recommended environment flag for fewer reallocations:
-  #   export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-  # Minimal run (BF16 AMP, single-pass residuals, no coarse ckpt):
-  #   python qlstm_train.py --augment 2 --batch 16 --amp 1 --amp-dtype bf16 --ckpt 0 --tbptt-k 0 --accum 2 --workers 8 --pin-memory 1 --persist 1 --prefetch 4 --warmup 0
+Esecuzione tipica:
+  export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+  python qlstm_train.py --augment 2 --batch 16 --amp 1 --amp-dtype bf16 --ckpt 0 \
+    --tbptt-k 0 --accum 2 --workers 8 --pin-memory 1 --persist 1 --prefetch 4 \
+    --val-interval 1 --val-max-batches 0 --warmup 0
 """
 
 from __future__ import annotations
 import argparse, json, os, time, math, inspect
-from pathlib import Path
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -69,22 +32,21 @@ from torch.amp import autocast, GradScaler
 # ---------------- project-local ----------------
 from src.config import (
     CSV_DIR, CSV_GLOB, INPUT_SIZE, HIDDEN_SIZE, NUM_LAYERS,
-    TRAIN_FRAC, VAL_FRAC, WINDOW_SIZE, DT,
+    TRAIN_FRAC, VAL_FRAC, WINDOW_SIZE, DT,                    # DT rimane per compat ma non usato nel residuo
     LAMBDA_SS, LAMBDA_TR, LAMBDA_WARMUP_EPOCHS,
     SEED, MAX_EPOCHS, PATIENCE, BATCH_SIZE, LEARNING_RATE,
     RTH_C, RTH_V, C_TH, T_ENV, PLOT_DPI, AUG_CYCLES
 )
 from src.data_utils import (
-    seed_everything, list_csv_files, load_all_csvs, compute_powers,
-    augment_cycle, sliding_windows, solve_reference_ode
+    seed_everything, load_all_csvs, compute_powers,
+    augment_cycle, solve_reference_ode
 )
 from src.dataset import WindowDataset
 from src.phys_models import T_steady_state, transient_residual
-from src.qat_int8 import LSTMModelInt8QAT  # QAT INT8
+from src.qat_int8 import LSTMModelInt8QAT
 
 CKPT_DIR = Path("checkpoints"); CKPT_DIR.mkdir(parents=True, exist_ok=True)
 PLOTS_DIR = Path("plots");      PLOTS_DIR.mkdir(parents=True, exist_ok=True)
-
 
 # ====================== utils ======================
 @dataclass
@@ -103,8 +65,7 @@ class EmptyDataset(Dataset):
     def __getitem__(self, idx): raise IndexError
 
 def build_concat_dataset(idxs, cycles_P, cycles_Tbp, cycles_Tjr, mu_x, std_x, mu_y, std_y):
-    if not idxs:
-        return EmptyDataset()
+    if not idxs: return EmptyDataset()
     ds_list = []
     for i in idxs:
         X = np.column_stack([cycles_P[i], cycles_Tbp[i]])
@@ -121,9 +82,7 @@ def r2(a,b):
     return float(1.0 - ss_res/ss_tot)
 
 def fmt_hms(seconds: float) -> str:
-    s = int(seconds + 0.5)
-    m, s = divmod(s, 60)
-    h, m = divmod(m, 60)
+    s = int(seconds + 0.5); m, s = divmod(s, 60); h, m = divmod(m, 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 def _supports_kwargs(fn, keys):
@@ -143,17 +102,12 @@ def forward_model(model, xb, *, use_ckpt: bool, ckpt_chunk: int, tbptt_k: int):
     Prova a usare TBPTT/ckpt fine-grained se il modello li espone via kwargs.
     Fallback: forward diretto, oppure checkpoint "coarse" dell'intero forward.
     """
-    # Percorso preferito: il modello accetta i kwargs (implementazione interna)
     if _supports_kwargs(model.forward, {"use_ckpt", "ckpt_chunk", "tbptt_k"}):
         return model(xb, use_ckpt=use_ckpt, ckpt_chunk=int(ckpt_chunk), tbptt_k=int(tbptt_k))
-
-    # Fallback "coarse": checkpoint dell'intero forward (compute extra in backward)
     if use_ckpt:
-        def _fwd(inp):
-            return model(inp)
+        def _fwd(inp): return model(inp)
         return ckpt.checkpoint(_fwd, xb, use_reentrant=False)
-    else:
-        return model(xb)
+    return model(xb)
 
 @torch.no_grad()
 def evaluate_epoch(model, dl, device, mu_y, std_y, *, amp_enabled: bool, amp_dtype: torch.dtype, max_batches: int | None = None):
@@ -166,8 +120,7 @@ def evaluate_epoch(model, dl, device, mu_y, std_y, *, amp_enabled: bool, amp_dty
             if max_batches is not None and i >= max_batches:
                 break
             xb = xb.to(device); yb = yb.to(device)
-            # In eval niente TBPTT/ckpt per metrica coerente
-            y_hat = model(xb)
+            y_hat = model(xb)  # in eval niente TBPTT/ckpt per metrica coerente
             tot += Fnn.mse_loss(y_hat, yb, reduction="sum").item()
             n   += yb.numel()
             preds.append((y_hat.float().cpu().numpy() * std_y + mu_y))
@@ -176,12 +129,12 @@ def evaluate_epoch(model, dl, device, mu_y, std_y, *, amp_enabled: bool, amp_dty
     yt = np.concatenate(gts)   if gts   else np.empty((0,), dtype=float)
     return tot/max(n,1), yh, yt
 
-
 # ====================== training (QAT) ======================
 def train_qat(
     model, dl_train, dl_val, device,
     mu_x, std_x, mu_y, std_y,
-    *,  # only keyword args from here
+    *,  # only keyword args below
+    dt: float,                                     # <-- dt misurato (in secondi)
     lambda_ss=LAMBDA_SS, lambda_tr=LAMBDA_TR,
     lr=LEARNING_RATE, max_epochs=MAX_EPOCHS, patience=PATIENCE,
     warmup_epochs=LAMBDA_WARMUP_EPOCHS,
@@ -195,7 +148,7 @@ def train_qat(
     except TypeError:
         opt = torch.optim.Adam(model.parameters(), lr=lr)
 
-    # GradScaler solo in FP16
+    # GradScaler solo per FP16
     scaler = GradScaler(enabled=(amp_enabled and amp_dtype == torch.float16))
     devtype = _devtype_from_device(device)
 
@@ -229,8 +182,7 @@ def train_qat(
                 xb = xb.to(device, non_blocking=pin)
                 yb = yb.to(device, non_blocking=pin)
 
-                # Costruiamo anche la finestra shiftata e concateniamo sul batch
-                # ⇒ un solo forward produce sia y_hat (curr) sia T_prev (prev)
+                # Single-pass twin-window: concateniamo (curr, prev) sul batch
                 xb_prev = torch.cat([xb[:, :1, :], xb[:, :-1, :]], dim=1)
                 xcat    = torch.cat([xb, xb_prev], dim=0)
 
@@ -240,10 +192,10 @@ def train_qat(
                     y_hat  = ycat[:B]          # (B,) normalized
                     T_prev = ycat[B:]          # (B,) normalized
 
-                    y_hat_deg = y_hat * std_y_t + mu_y_t       # °C
-                    loss_data = Fnn.mse_loss(y_hat, yb)
+                    y_hat_deg  = y_hat * std_y_t + mu_y_t       # °C
+                    loss_data  = Fnn.mse_loss(y_hat, yb)
 
-                    # ---- de-normalizza P,Tbp (ultimo passo finestra)
+                    # ---- de-normalizza P,Tbp (ultimo e penultimo passo finestra)
                     x_last = xb[:, -1, :]                      # (B,2) normalized
                     P_c    = x_last[:, 0] * std_x_t[0] + mu_x_t[0]
                     Tbp_c  = x_last[:, 1] * std_x_t[1] + mu_x_t[1]
@@ -253,7 +205,7 @@ def train_qat(
                         Tss = T_steady_state(P_c, Tbp_c, T_ENV, RTH_C, RTH_V)  # °C
                         loss_ss = Fnn.mse_loss(y_hat_deg, Tss)
 
-                    # ---- residuo transiente (SOLO predizioni; NO stop-grad)
+                    # ---- residuo transiente (SOLO predizioni; usa dt misurato)
                     if WINDOW_SIZE >= 2 and lam_tr > 0:
                         T_prev_deg = T_prev * std_y_t + mu_y_t
 
@@ -262,7 +214,7 @@ def train_qat(
                         Tbp_p  = x_prev[:, 1] * std_x_t[1] + mu_x_t[1]
 
                         r_tr = transient_residual(
-                            T_prev_deg, y_hat_deg, P_p, P_c, Tbp_p, Tbp_c, DT, RTH_C, RTH_V, C_TH, T_ENV
+                            T_prev_deg, y_hat_deg, P_p, P_c, Tbp_p, Tbp_c, dt, RTH_C, RTH_V, C_TH, T_ENV
                         )
                         loss_tr = torch.mean(r_tr**2)
                     else:
@@ -347,7 +299,6 @@ def train_qat(
 
     return model, history, best_val
 
-
 # ====================== main ======================
 def main():
     ap = argparse.ArgumentParser("QAT training – INT8 attention PI-LSTM (optimized)")
@@ -384,9 +335,9 @@ def main():
     ap.add_argument("--val-max-batches", type=int, default=0, help="limita i batch di val (0=nessun limite)")
     # data loading
     ap.add_argument("--workers", type=int, default=min(8, max(1, (os.cpu_count() or 2)//2)))
-    ap.add_argument("--pin-memory", type=int, default=1)
-    ap.add_argument("--persist", type=int, default=1)
-    ap.add_argument("--prefetch", type=int, default=4)
+    ap.add_argument("--pin-memory", type=int, default=1, help="pin memory for DataLoader (0/1)")
+    ap.add_argument("--persist", type=int, default=1, help="persist worker processes (0/1)")
+    ap.add_argument("--prefetch", type=int, default=4, help="number of batches to prefetch")
     args = ap.parse_args()
 
     seed_everything(args.seed)
@@ -397,14 +348,15 @@ def main():
         raise FileNotFoundError(f"Nessun CSV trovato in {CSV_DIR} (glob: {CSV_GLOB})")
 
     cycles_t, cycles_P, cycles_Tbp, cycles_Tjr = [], [], [], []
-    dt = float(datasets[0]["t"][1] - datasets[0]["t"][0])  # assume sampling fisso
+    # dt misurato (assume sampling costante per file)
+    dt = float(datasets[0]["t"][1] - datasets[0]["t"][0])
 
     for cols in datasets:
         P = compute_powers(cols["Id"], cols["Iq"])
         cycles_t.append(cols["t"]); cycles_P.append(P); cycles_Tbp.append(cols["Tbp"]); cycles_Tjr.append(cols["Tjr"])
         for _ in range(max(0, args.augment)):
             P2, Tbp2, Tjr2 = augment_cycle(P, cols["Tbp"], cols["Tjr"])
-            # shift di tempo solo per plotting cumulativo/ODE
+            # shift temporale solo per plotting cumulativo/ODE
             shift = (cycles_t[-1][-1] - cycles_t[-1][0]) + dt
             cycles_t.append(cols["t"] + shift)
             cycles_P.append(P2); cycles_Tbp.append(Tbp2); cycles_Tjr.append(Tjr2)
@@ -437,7 +389,7 @@ def main():
     per = bool(args.persist) if nw > 0 else False
     pf  = int(args.prefetch) if nw > 0 else None
 
-    dl_tr = DataLoader(ds_tr, batch_size=args.batch, shuffle=True,  num_workers=nw, pin_memory=pin, persistent_workers=per, prefetch_factor=pf, drop_last=True)
+    dl_tr = DataLoader(ds_tr, batch_size=args.batch, shuffle=True, num_workers=nw, pin_memory=pin, persistent_workers=per, prefetch_factor=pf, drop_last=True)
     dl_va = DataLoader(ds_va, batch_size=args.batch, shuffle=False, num_workers=nw, pin_memory=pin, persistent_workers=per, prefetch_factor=pf, drop_last=False)
     dl_te = DataLoader(ds_te, batch_size=args.batch, shuffle=False, num_workers=nw, pin_memory=pin, persistent_workers=per, prefetch_factor=pf, drop_last=False)
 
@@ -474,6 +426,7 @@ def main():
     model, hist, best_val = train_qat(
         model, dl_tr, dl_va, device,
         mu_x=mu_x, std_x=std_x, mu_y=mu_y, std_y=std_y,
+        dt=dt,  # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
         lambda_ss=args.lambda_ss, lambda_tr=args.lambda_tr,
         lr=args.lr, max_epochs=args.epochs, patience=PATIENCE, warmup_epochs=args.warmup,
         amp_enabled=bool(args.amp), amp_dtype=amp_dtype,
@@ -515,6 +468,7 @@ def main():
         "epochs": args.epochs, "batch": args.batch, "lr": args.lr,
         "lambda_ss": args.lambda_ss, "lambda_tr": args.lambda_tr, "warmup": args.warmup,
         "mu_x": mu_x.tolist(), "std_x": std_x.tolist(), "mu_y": mu_y, "std_y": std_y,
+        "dt_measured": float(dt), "DT_config": float(DT),
         "splits": {"train": split.train, "val": split.val, "test": split.test},
         "metrics": {"val_best_mse": best_val, "test_mse": test_mse, "test_mae": test_mae, "test_rmse": test_rmse, "test_r2": test_r2},
         "amp": bool(args.amp), "amp_dtype": args.amp_dtype, "ckpt": bool(args.ckpt),
@@ -525,10 +479,7 @@ def main():
     (CKPT_DIR/"meta_qat.json").write_text(json.dumps(meta, indent=2))
     print(f"\nSalvati: {best_path}, {last_path}, {CKPT_DIR/'meta_qat.json'}")
 
-
 if __name__ == "__main__":
     main()
 
-# Esempio consigliato:
-# export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-# python qlstm_train.py --augment 2 --batch 16 --amp 1 --amp-dtype bf16 --ckpt 0 --tbptt-k 0 --accum 2 --workers 8 --pin-memory 1 --persist 1 --prefetch 4 --val-interval 1 --val-max-batches 0 --warmup 0
+# python qlstm_train.py --augment 2 --batch 16 --accum 1 --amp 1 --amp-dtype fp16 --workers 8 --pin-memory 1 --persist 1 --prefetch 4 --val-interval 1 --val-max-batches 0

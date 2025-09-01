@@ -1,239 +1,274 @@
 from __future__ import annotations
-import torch, torch.nn as nn, torch.nn.functional as F
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import torch.utils.checkpoint as ckpt
 
-# ==============================
-# 1) Helper: fake-quant semplice
-# ==============================
+
+# =============================================
+# FakeQuant with EMA observer + delay + freeze
+# =============================================
 class FakeQuant(nn.Module):
-    def __init__(self, init_scale: float = 0.05, per_tensor: bool = True, eps: float = 1e-8):
+    """
+    Fake-quantization module for QAT.
+    - Per-tensor scale by default (per-channel handled explicitly in layers if needed).
+    - Uses an EMA observer for max-abs to stabilize scale estimation.
+    - Supports a quantization delay (bypass for the first N updates).
+    - Supports freezing the scale after a given number of updates.
+    """
+    def __init__(
+        self,
+        init_scale: float = 0.05,
+        per_tensor: bool = True,
+        eps: float = 1e-8,
+        ema_decay: float = 0.95,
+        quant_delay: int = 0,
+        freeze_after: int | None = None,
+    ):
         super().__init__()
-        self.register_buffer("scale", torch.tensor(init_scale, dtype=torch.float32))
         self.per_tensor = per_tensor
         self.eps = eps
+        self.ema_decay = float(ema_decay)
+        self.quant_delay = int(max(0, quant_delay))
+        self.freeze_after = int(freeze_after) if (freeze_after is not None) else None
+
+        # buffers
+        self.register_buffer("scale", torch.tensor(float(init_scale), dtype=torch.float32))
+        self.register_buffer("running_maxabs", torch.tensor(127.0 * float(init_scale), dtype=torch.float32))
+        self.register_buffer("num_updates", torch.tensor(0, dtype=torch.long))
+        self.register_buffer("frozen", torch.tensor(0, dtype=torch.uint8))  # 0/1
 
     @torch.no_grad()
-    def update_scale_(self, x: torch.Tensor):
+    def set_qat_hparams(self, *, ema_decay: float | None = None, quant_delay: int | None = None, freeze_after: int | None = None):
+        if ema_decay is not None:
+            self.ema_decay = float(ema_decay)
+        if quant_delay is not None:
+            self.quant_delay = int(max(0, quant_delay))
+        if freeze_after is not None:
+            self.freeze_after = int(freeze_after)
+
+    @torch.no_grad()
+    def _update_scale(self, x: torch.Tensor):
+        if self.frozen.item() == 1:
+            return
         maxabs = x.detach().abs().amax()
-        self.scale.copy_((maxabs + self.eps) / 127.0)
-
-    def forward(self, x: torch.Tensor):
-        if self.training:
-            self.update_scale_(x)
-        # usa una copia disaccoppiata (stabile con checkpointing/AMP)
-        s = self.scale.detach().clone().to(dtype=x.dtype, device=x.device)
-        q = torch.clamp(torch.round(x / s), -127, 127)
-        return q * s
-
-
-# ==============================================
-# 2) INT8 activations – STE con LUT (velocissime)
-# ==============================================
-# LUT in Q8: valori interi in [0..256] per sigmoid, [-256..256] per tanh
-# indicizzate con q_x ∈ [-127..127] -> idx = q_x + 127
-
-def _make_sigmoid_q8_lut(S_q8: int, device=None) -> torch.Tensor:
-    # y_q ∈ [-127..127] → y_float_q = y_q * S_q8 / 256
-    q = torch.arange(-127, 128, dtype=torch.float32, device=device)
-    y = torch.sigmoid(q * (S_q8 / 256.0))
-    lut = torch.round(y * 256.0).to(torch.int32)         # [0..256]
-    return torch.clamp(lut, 0, 256)
-
-def _make_tanh_q8_lut(S_q8: int, device=None) -> torch.Tensor:
-    q = torch.arange(-127, 128, dtype=torch.float32, device=device)
-    y = torch.tanh(q * (S_q8 / 256.0))
-    lut = torch.round(y * 256.0).to(torch.int32)         # [-256..256]
-    return torch.clamp(lut, -256, 256)
-
-class SigmoidInt8STE(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, y_float: torch.Tensor, S_q8: int, lut: torch.Tensor | None):
-        # quantizza input nel dominio INT8 (LSB = S_q8/256)
-        y_q = torch.clamp(torch.round(y_float * 256.0 / S_q8), -127, 127).to(torch.int64)
-        if lut is not None:
-            idx = (y_q + 127).to(torch.long)
-            y_q8 = lut[idx].to(torch.int32)              # Q8 int
+        # Initialize running_maxabs on first use to avoid cold-start bias
+        if self.num_updates.item() == 0:
+            self.running_maxabs.copy_(maxabs)
         else:
-            # fallback (mai usato con LUT attiva)
-            y = torch.sigmoid(y_float)
-            y_q8 = torch.round(y * 256.0).to(torch.int32)
-        y_hat = y_q8.to(y_float.dtype) / 256.0           # dequant
-
-        # STE: usa grad della sigmoid float
-        y_ref = torch.sigmoid(y_float)
-        ctx.save_for_backward(y_ref)
-        return y_hat
-
-    @staticmethod
-    def backward(ctx, grad_out):
-        (y_ref,) = ctx.saved_tensors
-        return grad_out * y_ref * (1 - y_ref), None, None
-
-class TanhInt8STE(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, y_float: torch.Tensor, S_q8: int, lut: torch.Tensor | None):
-        y_q = torch.clamp(torch.round(y_float * 256.0 / S_q8), -127, 127).to(torch.int64)
-        if lut is not None:
-            idx = (y_q + 127).to(torch.long)
-            y_q8 = lut[idx].to(torch.int32)              # Q8 int
-        else:
-            y = torch.tanh(y_float)
-            y_q8 = torch.round(y * 256.0).to(torch.int32)
-        y_hat = y_q8.to(y_float.dtype) / 256.0
-
-        y_ref = torch.tanh(y_float)
-        ctx.save_for_backward(y_ref)
-        return y_hat
-
-    @staticmethod
-    def backward(ctx, grad_out):
-        (y_ref,) = ctx.saved_tensors
-        return grad_out * (1 - y_ref.pow(2)), None, None
-
-def sigmoid_int8_ste(x: torch.Tensor, S_q8: int, lut: torch.Tensor | None): 
-    return SigmoidInt8STE.apply(x, S_q8, lut)
-
-def tanh_int8_ste(x: torch.Tensor, S_q8: int, lut: torch.Tensor | None): 
-    return TanhInt8STE.apply(x, S_q8, lut)
-
-# ==============================
-# 3) Linear quantizzato (QAT)
-# ==============================
-class QLinear(nn.Module):
-    """Linear con fake-quant su input e pesi (INT8 simmetrico)."""
-    def __init__(self, in_f, out_f, bias=True, init_scale_in=0.05, init_scale_w=0.02):
-        super().__init__()
-        self.w = nn.Parameter(torch.empty(out_f, in_f))
-        self.b = nn.Parameter(torch.zeros(out_f)) if bias else None
-        nn.init.kaiming_uniform_(self.w, a=5**0.5)
-        self.fq_in  = FakeQuant(init_scale_in)
-        self.fq_w   = FakeQuant(init_scale_w)
+            m = self.ema_decay
+            self.running_maxabs.copy_(m * self.running_maxabs + (1.0 - m) * maxabs)
+        new_scale = torch.clamp(self.running_maxabs / 127.0, min=self.eps)
+        self.scale.copy_(new_scale)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        xq = self.fq_in(x)              # fake-quant input
-        wq = self.fq_w(self.w)          # fake-quant pesi
-        return F.linear(xq, wq, self.b) # accumulo fp32 (QAT)
+        if self.training:
+            self.num_updates.add_(1)
 
-# =========================================
-# 4) LSTM cell INT8-QAT con stato ad alta Q
-#     + LUT registrate come buffer
-# =========================================
-class LSTMCellInt8QAT(nn.Module):
+            # Update observer (even during delay) so that scale is ready when Q starts
+            self._update_scale(x)
+
+            # Handle freeze
+            if self.freeze_after is not None and self.num_updates.item() >= self.freeze_after:
+                self.frozen.fill_(1)
+
+            # Delay: bypass quantization for the first N updates
+            if self.num_updates.item() <= self.quant_delay:
+                return x
+
+        # Straight-Through Estimator (STE) rounding
+        s = self.scale
+        q = torch.clamp(torch.round(x / s), -127.0, 127.0)
+        deq = q * s
+        # y = deq but with identity gradient wrt x
+        return x + (deq - x).detach()
+
+
+# ================================
+# Quantized Linear (per-tensor)
+# ================================
+class QLinear(nn.Module):
     """
-    - Pesi/attivazioni QAT INT8 con fake-quant.
-    - Porte: σ_int8 e tanh_int8 (STE) con scala Q8 fissata (configurabile).
-    - Stato c_t in float32 (alta precisione). h_t calcolato con tanh_int8.
-    - LUT per sigmoid/tanh: 3 tabelle distinte (i/f/o, g, tanh(c)).
+    Linear layer with fake-quant on inputs and weights (per-tensor scales).
+    Accumulation is done in FP32; bias is FP32.
+    """
+    def __init__(self, in_features: int, out_features: int, bias: bool = True,
+                 act_init_scale: float = 0.05, w_init_scale: float = 0.05):
+        super().__init__()
+        self.in_features = int(in_features)
+        self.out_features = int(out_features)
+
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = nn.Parameter(torch.empty(out_features)) if bias else None
+
+        # Fake-quant modules
+        self.qx = FakeQuant(init_scale=act_init_scale)   # per-tensor (activations)
+        self.qw = FakeQuant(init_scale=w_init_scale)     # per-tensor (weights)
+
+        # init
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1 / math.sqrt(fan_in)
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        xq = self.qx(x) if self.training else x
+        wq = self.qw(self.weight) if self.training else self.weight
+        return F.linear(xq, wq, self.bias)
+
+
+# =====================================
+# INT8-like activations with STE output
+# =====================================
+class SigmoidInt8STE(nn.Module):
+    """
+    Sigmoid followed by Q8 fake-quantization on the output (0..1 mapped to 0..256).
+    S_gate_q8 is kept for API compatibility (used at deploy to build LUTs), but
+    here we quantize the *output* to 1/256 steps with STE.
+    """
+    def __init__(self, S_gate_q8: int = 64):
+        super().__init__()
+        self.S_gate_q8 = int(S_gate_q8)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = torch.sigmoid(x)
+        q = torch.clamp(torch.round(y * 256.0), 0.0, 256.0)
+        deq = q / 256.0
+        return y + (deq - y).detach()
+
+
+class TanhInt8STE(nn.Module):
+    """
+    Tanh followed by Q8 fake-quantization on the output (-1..1 mapped to -256..256).
+    S_tanhc_q8 is kept for API compatibility (deploy LUTs); training uses STE on output.
+    """
+    def __init__(self, S_tanhc_q8: int = 128):
+        super().__init__()
+        self.S_tanhc_q8 = int(S_tanhc_q8)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = torch.tanh(x)
+        q = torch.clamp(torch.round(y * 256.0), -256.0, 256.0)
+        deq = q / 256.0
+        return y + (deq - y).detach()
+
+
+# ===============================
+# QAT LSTM cell (INT8 activations)
+# ===============================
+class QLSTMCell(nn.Module):
+    """
+    LSTM cell with:
+      - QLinear for input/hidden projections (fake-quantized weights/acts)
+      - INT8-like gate activations with STE (σ, tanh)
+      - Cell state kept in FP32 (with optional clamp to [-8,8] to avoid blow-up)
     """
     def __init__(self, input_size: int, hidden_size: int,
-                 S_gate_q8: int = 32, S_tanhc_q8: int = 64, use_lut: bool = True):
+                 S_gate_q8: int = 64, S_tanhc_q8: int = 128):
         super().__init__()
-        self.H = hidden_size
-        self.ih = QLinear(input_size, 4*hidden_size, bias=True)
-        self.hh = QLinear(hidden_size, 4*hidden_size, bias=True)
-        self.S_gate_q8  = int(S_gate_q8)
-        self.S_tanhc_q8 = int(S_tanhc_q8)
-        self.c_clip = 8.0
-        self.use_lut = bool(use_lut)
+        H = hidden_size
+        self.input_size = int(input_size)
+        self.hidden_size = int(hidden_size)
 
-        # --- LUT (come buffer, si muovono con .to(device)) ---
-        if self.use_lut:
-            # costruite su CPU; verranno spostate col .to()
-            sig_gate = _make_sigmoid_q8_lut(self.S_gate_q8, device="cpu")
-            tanh_gate= _make_tanh_q8_lut   (self.S_gate_q8, device="cpu")
-            tanh_c   = _make_tanh_q8_lut   (self.S_tanhc_q8, device="cpu")
-            self.register_buffer("lut_sig_gate", sig_gate, persistent=False)
-            self.register_buffer("lut_tanh_gate", tanh_gate, persistent=False)
-            self.register_buffer("lut_tanh_c",   tanh_c,   persistent=False)
-        else:
-            self.lut_sig_gate = None
-            self.lut_tanh_gate= None
-            self.lut_tanh_c   = None
+        self.ih = QLinear(input_size, 4 * H, bias=True)
+        self.hh = QLinear(H,         4 * H, bias=True)
 
-    def forward(self, x_t: torch.Tensor, state: tuple[torch.Tensor, torch.Tensor]):
+        self.sigmoid_q8 = SigmoidInt8STE(S_gate_q8)
+        self.tanh_q8    = TanhInt8STE(S_tanhc_q8)
+
+        self.c_clamp = 8.0  # mildly constrain c to stabilize long sequences
+
+    def forward(self, x_t: torch.Tensor, state: tuple[torch.Tensor, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         h, c = state
-        gates = self.ih(x_t) + self.hh(h)  # [B, 4H]
+        gates = self.ih(x_t) + self.hh(h)  # (B,4H)
         i, f, g, o = gates.chunk(4, dim=1)
-
-        i = sigmoid_int8_ste(i, self.S_gate_q8, self.lut_sig_gate)   # [0,1]
-        f = sigmoid_int8_ste(f, self.S_gate_q8, self.lut_sig_gate)   # [0,1]
-        g = tanh_int8_ste   (g, self.S_gate_q8, self.lut_tanh_gate)  # [-1,1]
-        o = sigmoid_int8_ste(o, self.S_gate_q8, self.lut_sig_gate)   # [0,1]
-
-        c = torch.clamp(f * c + i * g, -self.c_clip, self.c_clip)    # stato ad alta Q
-        h = o * tanh_int8_ste(c, self.S_tanhc_q8, self.lut_tanh_c)   # h da tanh INT8
+        i = self.sigmoid_q8(i)
+        f = self.sigmoid_q8(f)
+        g = self.tanh_q8(g)
+        o = self.sigmoid_q8(o)
+        c = f * c + i * g
+        # Optional clamp to keep c in a range that matches LUT-based tanh later
+        if self.c_clamp is not None:
+            c = torch.clamp(c, -self.c_clamp, self.c_clamp)
+        h = o * self.tanh_q8(c)
         return h, c
 
-# =========================================
-# 5) Encoder LSTM (unico layer) + attention
-#     – TBPTT + (facoltativo) activation checkpointing
-# =========================================
+
+# ===========================================
+# High-level model: LSTM + attention + head
+# ===========================================
 class LSTMModelInt8QAT(nn.Module):
     """
-    Interfaccia: input (B,W,F) -> out (B,)
-    Stato c_t resta float32; porte/h_t via activ INT8 (STE).
-    Attention/softmax in float. Supporta:
-      - tbptt_k: tronca il grafo ogni K step
-      - use_ckpt: activation checkpointing nel loop temporale (sconsigliato su laptop)
-      - ckpt_chunk: applica checkpointing su blocchi di passi
-      - mc_dropout: abilita dropout anche in eval (per MC dropout)
+    Quantization-aware, physics-ready LSTM model for T̂ prediction.
+    - Input:  (B, W, D)
+    - Output: (B,) scalar (°C normalized; de-norm handled outside)
+    - Internals: stacked QLSTM + simple dot-product attention on the last layer
     """
-    def __init__(self, input_size: int, hidden_size: int, num_layers: int = 1, dropout_p: float = 0.10,
-                 S_gate_q8: int = 32, S_tanhc_q8: int = 64, use_lut: bool = True):
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        num_layers: int = 1,
+        dropout_p: float = 0.0,
+        S_gate_q8: int = 64,
+        S_tanhc_q8: int = 128,
+    ):
         super().__init__()
-        assert num_layers == 1, "Questa implementazione supporta 1 solo layer."
-        self.hidden_size = hidden_size
-        self.dropout_p   = dropout_p
-        self.cell = LSTMCellInt8QAT(input_size, hidden_size, S_gate_q8, S_tanhc_q8, use_lut=use_lut)
-        self.fc   = nn.Linear(hidden_size * 2, 1)
+        assert num_layers >= 1
+        self.input_size = int(input_size)
+        self.hidden_size = int(hidden_size)
+        self.num_layers = int(num_layers)
+        self.dropout_p = float(dropout_p)
 
-    # step "puro": utile per checkpointing
-    def _step(self, x_t: torch.Tensor, h: torch.Tensor, c: torch.Tensor):
-        return self.cell(x_t, (h, c))
+        layers = []
+        in_sz = input_size
+        for _ in range(num_layers):
+            layers.append(QLSTMCell(in_sz, hidden_size, S_gate_q8, S_tanhc_q8))
+            in_sz = hidden_size
+        self.layers = nn.ModuleList(layers)
+
+        # attention + head
+        self.fc = QLinear(2 * hidden_size, 1, bias=True)
 
     def forward(
         self,
-        x: torch.Tensor,
-        *,
-        mc_dropout: bool = False,
-        tbptt_k: int = 0,
+        x: torch.Tensor,                          # (B, W, D)
         use_ckpt: bool = False,
-        ckpt_chunk: int = 16
+        ckpt_chunk: int = 0,
+        tbptt_k: int = 0,
+        mc_dropout: bool = False,
     ) -> torch.Tensor:
-        B, W, _ = x.shape
-        device  = x.device
-        h = torch.zeros(B, self.hidden_size, device=device, dtype=x.dtype)
-        c = torch.zeros(B, self.hidden_size, device=device, dtype=x.dtype)
+        B, W, D = x.shape
+        assert D == self.input_size
+
+        # initial states
+        h_states = [x.new_zeros(B, self.hidden_size) for _ in range(self.num_layers)]
+        c_states = [x.new_zeros(B, self.hidden_size) for _ in range(self.num_layers)]
 
         outputs = []
-        if use_ckpt:
-            # (puoi lasciarlo OFF: con LUT è già veloce e risparmi recompute)
-            for t in range(W):
-                x_t = x[:, t, :]
-                if t % max(ckpt_chunk, 1) != 0:
-                    h, c = ckpt.checkpoint(self._step, x_t, h, c, use_reentrant=False)
-                else:
-                    h, c = self._step(x_t, h, c)
-                outputs.append(h)
-                if tbptt_k and ((t + 1) % tbptt_k == 0):
-                    h = h.detach(); c = c.detach()
-        else:
-            # percorso veloce senza checkpoint
-            for t in range(W):
-                h, c = self._step(x[:, t, :], h, c)
-                outputs.append(h)
-                if tbptt_k and ((t + 1) % tbptt_k == 0):
-                    h = h.detach(); c = c.detach()
+        # Simple unroll; kwargs are accepted to enable upstream capability detection,
+        # but here we keep it straightforward for robustness/speed.
+        for t in range(W):
+            x_t = x[:, t, :]
+            for l, cell in enumerate(self.layers):
+                h_states[l], c_states[l] = cell(x_t, (h_states[l], c_states[l]))
+                x_t = h_states[l]
+                # TBPTT detach (optional, if requested)
+                if tbptt_k and ((t + 1) % int(tbptt_k) == 0):
+                    h_states[l] = h_states[l].detach()
+                    c_states[l] = c_states[l].detach()
+            outputs.append(x_t)
 
-        outputs = torch.stack(outputs, dim=1)   # (B, W, H)
-        query   = h                              # (B, H)
-
-        # attention: dot-product semplice
-        scores  = torch.bmm(outputs, query.unsqueeze(2)).squeeze(2)   # (B, W)
+        # attention over time
+        H_last = h_states[-1]  # (B,H)
+        Y_seq = torch.stack(outputs, dim=1)  # (B,W,H)
+        scores = torch.bmm(Y_seq, H_last.unsqueeze(2)).squeeze(2)  # (B,W)
         weights = F.softmax(scores, dim=1)
-        context = torch.bmm(weights.unsqueeze(1), outputs).squeeze(1) # (B, H)
+        context = torch.bmm(weights.unsqueeze(1), Y_seq).squeeze(1)  # (B,H)
 
-        combined = torch.cat([query, context], dim=1)                 # (B, 2H)
+        combined = torch.cat([H_last, context], dim=1)  # (B,2H)
         combined = F.dropout(combined, p=self.dropout_p, training=(self.training or mc_dropout))
-        out = self.fc(combined).squeeze(-1)                            # (B,)
+        out = self.fc(combined).squeeze(-1)  # (B,)
         return out

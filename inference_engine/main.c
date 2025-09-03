@@ -5,7 +5,7 @@
 //   ./run_infer out_preds.bin out_truth.bin
 //
 // Compilazione (dataset float):
-//   gcc -O3 -std=c11 -Wall -Wextra -o run_infer engine.c sigmoid.c tanh.c main.c -lm
+//   gcc -O3 -std=c11 -Wall -Wextra -o run_infer engine.c sigmoid_poly.c tanh_poly.c main.c -lm
 //
 // Compilazione (dataset quantizzato TEST_XQ):
 //   gcc -O3 -std=c11 -Wall -Wextra -DUSE_QTEST=1 -o run_infer engine.c sigmoid.c tanh.c main.c -lm

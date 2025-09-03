@@ -2,7 +2,6 @@
 #include <string.h>
 #include "engine.h"
 #include "activations.h"
-#include <stdio.h>
 
 #ifndef GATE_I
 #define GATE_I 1  // i
@@ -115,7 +114,6 @@ static inline void lstm_step_layer(
         int16_t tnh_c = tanh_from_c_q8(st->c[layer][u]);
         st->h[layer][u] = q8_mul(o_q8, tnh_c);
     }
-    printf("Layer %d: sat_pre=%d, sat_c=%d, tot=%d\n", layer, sat_pre, sat_c, tot);
 }
 
 // ---------- inference su finestra ----------

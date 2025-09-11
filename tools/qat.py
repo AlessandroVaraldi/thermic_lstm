@@ -312,8 +312,8 @@ def main():
     ap.add_argument("--hidden", type=int, default=HIDDEN_SIZE)
     ap.add_argument("--layers", type=int, default=NUM_LAYERS)
     ap.add_argument("--dropout", type=float, default=0.10)
-    ap.add_argument("--S-gate-q8",  type=int, default=32, help="scala Q8 per pre-attivazioni porte")
-    ap.add_argument("--S-tanhc-q8", type=int, default=64, help="scala Q8 per tanh(c)")
+    ap.add_argument("--S-gate-q8",  type=int, default=32, help="Q8 scale for gate pre-activations")
+    ap.add_argument("--S-tanhc-q8", type=int, default=64, help="Q8 scale for tanh(c)")
     # training hparams
     ap.add_argument("--epochs", type=int, default=MAX_EPOCHS)
     ap.add_argument("--batch",  type=int, default=BATCH_SIZE)
@@ -326,22 +326,22 @@ def main():
     # memory/perf
     ap.add_argument("--amp", type=int, default=1, help="enable AMP mixed precision (1/0)")
     ap.add_argument("--amp-dtype", type=str, default="bf16", choices=["bf16", "fp16"], help="AMP dtype")
-    ap.add_argument("--ckpt", type=int, default=0, help="activation checkpointing coarse (1/0) — sconsigliato")
-    ap.add_argument("--ckpt-chunk", type=int, default=16, help="(usato solo se il modello supporta ckpt fine-grained)")
-    ap.add_argument("--tbptt-k", type=int, default=0, help="truncate BPTT ogni K step se supportato (0=off)")
+    ap.add_argument("--ckpt", type=int, default=0, help="activation checkpointing coarse (1/0) — not recommended")
+    ap.add_argument("--ckpt-chunk", type=int, default=16, help="(used only if model supports fine-grained ckpt)")
+    ap.add_argument("--tbptt-k", type=int, default=0, help="truncate BPTT every K steps if supported (0=off)")
     ap.add_argument("--accum", type=int, default=1, help="gradient accumulation steps")
     ap.add_argument("--compile", type=int, default=0, help="torch.compile model (0/1)")
-    ap.add_argument("--fused-adam", type=int, default=1, help="usa Adam fused se disponibile (0/1)")
-    # validazione
-    ap.add_argument("--val-interval", type=int, default=1, help="valuta ogni K epoch")
-    ap.add_argument("--val-max-batches", type=int, default=0, help="limita i batch di val (0=nessun limite)")
+    ap.add_argument("--fused-adam", type=int, default=1, help="use Adam fused if available (0/1)")
+    # validation
+    ap.add_argument("--val-interval", type=int, default=1, help="validate every K epochs")
+    ap.add_argument("--val-max-batches", type=int, default=0, help="limit val batches (0=no limit)")
     # data loading
     ap.add_argument("--workers", type=int, default=min(8, max(1, (os.cpu_count() or 2)//2)))
     ap.add_argument("--pin-memory", type=int, default=1, help="pin memory for DataLoader (0/1)")
     ap.add_argument("--persist", type=int, default=1, help="persist worker processes (0/1)")
     ap.add_argument("--prefetch", type=int, default=4, help="number of batches to prefetch")
-    # mixed-precision temporale (leggero: solo scaling/rshift, nessun cambio attivazioni)
-    ap.add_argument("--mp-time", type=int, default=0, help="temporale mixed precision (0/1)")
+    # temporal mixed-precision (lightweight: only scaling/rshift, no activation changes)
+    ap.add_argument("--mp-time", type=int, default=0, help="temporal mixed precision (0/1)")
     ap.add_argument("--mp-tau-thr", type=float, default=0.08, help="transient threshold (°C/s)")
     ap.add_argument("--mp-scale-mul", type=float, default=1.5, help="scale factor for S_gate in mp-time")
     ap.add_argument("--mp-rshift-delta", type=int, default=-1, help="delta right-shift for S_gate in mp-time")
@@ -353,7 +353,7 @@ def main():
     # ------------ load CSVs & build cycles ------------
     datasets = load_all_csvs()
     if len(datasets) == 0:
-        raise FileNotFoundError(f"Nessun CSV trovato in {CSV_DIR} (glob: {CSV_GLOB})")
+        raise FileNotFoundError(f"No CSV found in {CSV_DIR} (glob: {CSV_GLOB})")
 
     cycles_t, cycles_P, cycles_Tbp, cycles_Tjr = [], [], [], []
     dts = [float(np.median(np.diff(cols["t"]))) for cols in datasets]
@@ -486,7 +486,7 @@ def main():
     test_rmse= rmse(y_pred_test, y_true_test)
     test_r2  = r2  (y_pred_test, y_true_test)
 
-    print("\n=== Test (denormalizzato, °C) ===")
+    print("\n=== Test (denormalized, °C) ===")
     print(f"MSE : {test_mse:.6f}")
     print(f"MAE : {test_mae:.6f}")
     print(f"RMSE: {test_rmse:.6f}")
@@ -495,18 +495,18 @@ def main():
     # ------------ EXPORT INT8 (for inference) ------------
     try:
         import numpy as _np
-        # 0) DataLoader "sicuro" per calibrazione: no worker, no pin
+        # 0) Safe DataLoader for calibration: no worker, no pin
         from torch.utils.data import DataLoader as _DL
         _cal_ds = ds_va if len(ds_va) > 0 else ds_tr
         _dl_cal = _DL(_cal_ds, batch_size=args.batch, shuffle=False, num_workers=0, pin_memory=False)
 
-        # 1) calibrazione veloce delle scale pre-att (per gate, per layer)
+        # 1) Fast calibration of pre-att scales (per gate, per layer)
         if hasattr(model, "calibrate_preact_scales"):
             pre_scales = model.calibrate_preact_scales(_dl_cal, device, max_batches=8)
         else:
-            raise RuntimeError("model.calibrate_preact_scales() mancante")
+            raise RuntimeError("model.calibrate_preact_scales() missing")
 
-        # 2) prepara pacchetto json e binario
+        # 2) Prepare json and binary package
         bin_path = CKPT_DIR/"model_int8.bin"
         json_path = CKPT_DIR/"model_int8.json"
         offsets = {"layers": [], "fc": {}}
@@ -518,12 +518,12 @@ def main():
             "norm": {"mu_x": mu_x.tolist(), "std_x": std_x.tolist(), "mu_y": mu_y, "std_y": std_y},
         }
 
-        # helper: scrittura bytes e gestione offset (in BYTE, little-endian)
+        # helper: write bytes and manage offset (in BYTE, little-endian)
         off_bytes = 0
         def _write_arr(fh, tensor, dtype):
             nonlocal off_bytes
             arr = tensor.detach().cpu().numpy().astype(dtype, copy=False)
-            if arr.dtype == _np.int32 and arr.dtype.byteorder not in ('<','='):  # forza LE per i32
+            if arr.dtype == _np.int32 and arr.dtype.byteorder not in ('<','='):  # force LE for i32
                 arr = arr.newbyteorder('<')
             data = arr.tobytes(order="C")
             start = off_bytes
@@ -532,7 +532,7 @@ def main():
             return start, len(data)
 
         with open(bin_path, "wb") as fh:
-            # Per-layer: ih e hh
+            # Per-layer: ih and hh
             for li, cell in enumerate(model.layers):
                 layer_entry = {"idx": li, "ih": {}, "hh": {}, "S_gate_q8": int(cell.sigmoid_q8.S_gate_q8),
                             "S_tanhc_q8": int(cell.tanh_q8_c.S_tanhc_q8),
@@ -541,7 +541,7 @@ def main():
 
                 # ---- IH ----
                 if not hasattr(model, "quantize_linear_int8") or not hasattr(model, "compute_requant"):
-                    raise RuntimeError("quantize_linear_int8/compute_requant mancanti nel modello")
+                    raise RuntimeError("quantize_linear_int8/compute_requant missing in model")
                 ih_W, ih_b, ih_Sx, ih_Sw = model.quantize_linear_int8(cell.ih)
                 layer_entry["ih"]["W_shape"] = list(ih_W.shape)  # [4H, in]
                 w_off, w_nbytes = _write_arr(fh, ih_W, _np.int8)

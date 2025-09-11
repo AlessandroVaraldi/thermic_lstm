@@ -1,7 +1,7 @@
 // src/engine.c
 #include "engine.h"
 #include "acts.h"
-#include "checkpoints/model_offsets.h"  // generato da json2offsets.py
+#include "include/model_offsets.h"  // generato da json2offsets.py
 
 // ---------- Bind pesi dal blob ----------
 void qat_bind_weights(qat_model_t *m, const uint8_t *blob)

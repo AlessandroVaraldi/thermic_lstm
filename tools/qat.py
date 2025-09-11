@@ -139,6 +139,8 @@ def train_qat(
     best_val = float("inf"); best_w = {k:v.detach().clone() for k,v in model.state_dict().items()}
     history = {"train": [], "val": []}
     patience_left = patience
+    # checkpoint paths
+    best_path = CKPT_DIR/"best_qat.pth"; last_path = CKPT_DIR/"last_qat.pth"
 
     mu_x_t = torch.tensor(mu_x,  device=device, requires_grad=False)
     std_x_t= torch.tensor(std_x, device=device, requires_grad=False)
@@ -240,19 +242,33 @@ def train_qat(
             history["val"].append(val_mse)
 
             # ---------------- CKPT / EARLY STOP + LOG -----------
-            improved = do_val and (val_mse < best_val - 1e-12)
+            ckpt_active = (epoch >= int(warmup_epochs))
+            improved = do_val and ckpt_active and (val_mse < best_val - 1e-12)
             if improved:
                 best_val = val_mse
                 best_w = {k:v.detach().clone() for k,v in model.state_dict().items()}
                 patience_left = patience
                 tag = "✓"
-            elif do_val:
+            elif do_val and ckpt_active:
                 patience_left -= 1
                 tag = " "
+            elif do_val and not ckpt_active:
+                tag = "w"  # warmup
             else:
                 tag = "·"
 
             ep_dt = time.perf_counter() - ep_t0
+
+            # ----- SAVE CKPTS -----
+            try:
+                torch.save({"model": model.state_dict()}, last_path)
+            except Exception as e:
+                print(f"[ckpt] last save skipped: {e}")
+            if improved:
+                try:
+                    torch.save({"model": best_w}, best_path)
+                except Exception as e:
+                    print(f"[ckpt] best save skipped: {e}")
             print(
                 f"[{epoch:03d}] train={train_avg:.6f}  val={val_mse:.6f}  "
                 f"λss={lam_ss:.2e} λtr={lam_tr:.2e}  "
@@ -261,7 +277,7 @@ def train_qat(
                 flush=True
             )
 
-            if do_val and patience_left <= 0:
+            if do_val and ckpt_active and patience_left <= 0:
                 print(f"Early stopping (best val={best_val:.6f})")
                 break
 
@@ -446,7 +462,6 @@ def main():
     # ------------ save ------------
     best_path = CKPT_DIR/"best_qat.pth"; last_path = CKPT_DIR/"last_qat.pth"
     torch.save({"model": model.state_dict()}, best_path)
-    torch.save({"model": model.state_dict()}, last_path)
 
     try:
         if hasattr(model, "export_quant_metadata"):
@@ -480,11 +495,18 @@ def main():
     # ------------ EXPORT INT8 (for inference) ------------
     try:
         import numpy as _np
-        if hasattr(model, "calibrate_preact_scales"):
-            pre_scales = model.calibrate_preact_scales(dl_va, device, max_batches=8)
-        else:
-            raise RuntimeError("model.calibrate_preact_scales() missing")
+        # 0) DataLoader "sicuro" per calibrazione: no worker, no pin
+        from torch.utils.data import DataLoader as _DL
+        _cal_ds = ds_va if len(ds_va) > 0 else ds_tr
+        _dl_cal = _DL(_cal_ds, batch_size=args.batch, shuffle=False, num_workers=0, pin_memory=False)
 
+        # 1) calibrazione veloce delle scale pre-att (per gate, per layer)
+        if hasattr(model, "calibrate_preact_scales"):
+            pre_scales = model.calibrate_preact_scales(_dl_cal, device, max_batches=8)
+        else:
+            raise RuntimeError("model.calibrate_preact_scales() mancante")
+
+        # 2) prepara pacchetto json e binario
         bin_path = CKPT_DIR/"model_int8.bin"
         json_path = CKPT_DIR/"model_int8.json"
         offsets = {"layers": [], "fc": {}}
@@ -492,14 +514,17 @@ def main():
             "format": "INT8-LSTM-v1",
             "layers": [],
             "fc": {},
-            "pre_scales": pre_scales,  # S_pre(gate)=amax/127 (fp float)
+            "pre_scales": pre_scales,
             "norm": {"mu_x": mu_x.tolist(), "std_x": std_x.tolist(), "mu_y": mu_y, "std_y": std_y},
         }
 
+        # helper: scrittura bytes e gestione offset (in BYTE, little-endian)
         off_bytes = 0
         def _write_arr(fh, tensor, dtype):
             nonlocal off_bytes
             arr = tensor.detach().cpu().numpy().astype(dtype, copy=False)
+            if arr.dtype == _np.int32 and arr.dtype.byteorder not in ('<','='):  # forza LE per i32
+                arr = arr.newbyteorder('<')
             data = arr.tobytes(order="C")
             start = off_bytes
             fh.write(data)
@@ -507,15 +532,16 @@ def main():
             return start, len(data)
 
         with open(bin_path, "wb") as fh:
+            # Per-layer: ih e hh
             for li, cell in enumerate(model.layers):
                 layer_entry = {"idx": li, "ih": {}, "hh": {}, "S_gate_q8": int(cell.sigmoid_q8.S_gate_q8),
-                               "S_tanhc_q8": int(cell.tanh_q8_c.S_tanhc_q8),
-                               "pre_scales": pre_scales[li]}
+                            "S_tanhc_q8": int(cell.tanh_q8_c.S_tanhc_q8),
+                            "pre_scales": pre_scales[li]}
                 offsets["layers"].append({"idx": li})
 
                 # ---- IH ----
                 if not hasattr(model, "quantize_linear_int8") or not hasattr(model, "compute_requant"):
-                    raise RuntimeError("quantize_linear_int8/compute_requant missing from model")
+                    raise RuntimeError("quantize_linear_int8/compute_requant mancanti nel modello")
                 ih_W, ih_b, ih_Sx, ih_Sw = model.quantize_linear_int8(cell.ih)
                 layer_entry["ih"]["W_shape"] = list(ih_W.shape)  # [4H, in]
                 w_off, w_nbytes = _write_arr(fh, ih_W, _np.int8)
@@ -526,7 +552,6 @@ def main():
                     offsets["layers"][-1]["ih_b_off"] = int(b_off)
                     offsets["layers"][-1]["ih_b_nbytes"] = int(b_nbytes)
                 layer_entry["ih"]["Sx"] = float(ih_Sx); layer_entry["ih"]["Sw"] = float(ih_Sw)
-
                 rq_ih = {}
                 for k in ("i","f","g","o"):
                     m, r = model.compute_requant(ih_Sx, ih_Sw, pre_scales[li][k])
@@ -553,9 +578,7 @@ def main():
                 pkg["layers"].append(layer_entry)
 
             # FC (head)
-            fc_W, fc_b, fc_Sx, fc_Sw = model.quantize_linear_int8(model.fc) if hasattr(model, "quantize_linear_int8") else (None,None,None,None)
-            if fc_W is None:
-                raise RuntimeError("quantize_linear_int8() mancante per FC")
+            fc_W, fc_b, fc_Sx, fc_Sw = model.quantize_linear_int8(model.fc)
             pkg["fc"]["W_shape"] = list(fc_W.shape)  # [1, 2H]
             w_off, w_nbytes = _write_arr(fh, fc_W, _np.int8)
             offsets["fc"]["W_off"] = int(w_off); offsets["fc"]["W_nbytes"] = int(w_nbytes)

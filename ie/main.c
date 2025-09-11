@@ -5,17 +5,17 @@
 #include <string.h>
 
 #include "include/engine.h"               // API dell’engine (fornito prima)
-#include "src/acts.h"                     // attivazioni integer
+#include "include/acts.h"                     // attivazioni integer
 #include "include/model_offsets.h"    // generato da json2offsets.py
 
 // ======= CONFIG =======
 // scegli come importare la reference PyTorch:
-// 1) Header statico generato: checkpoints/ref_example.h
-// 2) Binario: checkpoints/ref_example.bin
+// 1) Header statico generato: include/ref_example.h
+// 2) Binario: include/ref_example.bin
 // 3) Se vuoi embed del model bin, definisci EMBED_MODEL_BIN e fornisci i simboli linker.
 #define REF_FROM_HEADER 1   // 1=header, 0=binario
-#define MODEL_BIN_PATH  "checkpoints/model_int8.bin"
-#define REF_BIN_PATH    "checkpoints/ref_example.bin"
+#define MODEL_BIN_PATH  "include/model_int8.bin"
+#define REF_BIN_PATH    "include/ref_example.bin"
 
 // ======= Opzionale: simboli linker per embed del model bin =======
 // extern const unsigned char _binary_model_int8_bin_start[];

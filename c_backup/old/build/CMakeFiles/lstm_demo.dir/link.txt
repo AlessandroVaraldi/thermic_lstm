@@ -1,0 +1,1 @@
+/usr/bin/cc -g -fsanitize=address,undefined CMakeFiles/lstm_demo.dir/main.c.o -o lstm_demo  -lm 

@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as ckpt
-
+from contextlib import contextmanager
 
 # =============================================
 # FakeQuant with EMA observer + delay + freeze
@@ -98,6 +98,7 @@ class QLinear(nn.Module):
         super().__init__()
         self.in_features = int(in_features)
         self.out_features = int(out_features)
+        self.force_quant: bool = False  # abilita quant anche in eval (usato da quant_eval)
 
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
         self.bias = nn.Parameter(torch.empty(out_features)) if bias else None
@@ -114,8 +115,9 @@ class QLinear(nn.Module):
             nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        xq = self.qx(x) if self.training else x
-        wq = self.qw(self.weight) if self.training else self.weight
+        do_q = self.training or self.force_quant
+        xq = self.qx(x) if do_q else x
+        wq = self.qw(self.weight) if do_q else self.weight
         return F.linear(xq, wq, self.bias)
 
 
@@ -131,11 +133,13 @@ class SigmoidInt8STE(nn.Module):
     def __init__(self, S_gate_q8: int = 64):
         super().__init__()
         self.S_gate_q8 = int(S_gate_q8)
+        self._grid = 256.0  # passi di quantizzazione sull'output (non toccata dalla MP-time)
+
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = torch.sigmoid(x)
-        q = torch.clamp(torch.round(y * 256.0), 0.0, 256.0)
-        deq = q / 256.0
+        q = torch.clamp(torch.round(y * self._grid), 0.0, self._grid)
+        deq = q / self._grid
         return y + (deq - y).detach()
 
 
@@ -147,13 +151,18 @@ class TanhInt8STE(nn.Module):
     def __init__(self, S_tanhc_q8: int = 128):
         super().__init__()
         self.S_tanhc_q8 = int(S_tanhc_q8)
+        self._grid = 256.0  # passi di quantizzazione sull'output (base); può essere aumentata per MP-time
+
+    @torch.no_grad()
+    def set_grid(self, grid: float):
+        """Imposta la griglia di quantizzazione output (>=256 => risoluzione più fine)."""
+        self._grid = float(max(1.0, grid))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = torch.tanh(x)
-        q = torch.clamp(torch.round(y * 256.0), -256.0, 256.0)
-        deq = q / 256.0
+        q = torch.clamp(torch.round(y * self._grid), -self._grid, self._grid)
+        deq = q / self._grid
         return y + (deq - y).detach()
-
 
 # ===============================
 # QAT LSTM cell (INT8 activations)
@@ -176,7 +185,9 @@ class QLSTMCell(nn.Module):
         self.hh = QLinear(H,         4 * H, bias=True)
 
         self.sigmoid_q8 = SigmoidInt8STE(S_gate_q8)
-        self.tanh_q8    = TanhInt8STE(S_tanhc_q8)
+        # separiamo tanh per g e per c(t) per abilitare MP-time solo su tanh(c)
+        self.tanh_q8_g  = TanhInt8STE(S_tanhc_q8)
+        self.tanh_q8_c  = TanhInt8STE(S_tanhc_q8)
 
         self.c_clamp = 8.0  # mildly constrain c to stabilize long sequences
 
@@ -186,13 +197,13 @@ class QLSTMCell(nn.Module):
         i, f, g, o = gates.chunk(4, dim=1)
         i = self.sigmoid_q8(i)
         f = self.sigmoid_q8(f)
-        g = self.tanh_q8(g)
+        g = self.tanh_q8_g(g)
         o = self.sigmoid_q8(o)
         c = f * c + i * g
         # Optional clamp to keep c in a range that matches LUT-based tanh later
         if self.c_clamp is not None:
             c = torch.clamp(c, -self.c_clamp, self.c_clamp)
-        h = o * self.tanh_q8(c)
+        h = o * self.tanh_q8_c(c)
         return h, c
 
 
@@ -231,6 +242,14 @@ class LSTMModelInt8QAT(nn.Module):
 
         # attention + head
         self.fc = QLinear(2 * hidden_size, 1, bias=True)
+        # ----- quant-eval toggle -----
+        self._quant_eval_enabled: bool = False
+
+        # ----- mixed-precision temporale (leggera) -----
+        self._mp_time_enabled: bool = False
+        self._mp_tau_thr: float = 0.08
+        self._mp_grid_base: float = 256.0
+        self._mp_grid_fine: float = 512.0  # default; viene settata da enable_time_mixed_precision()
 
     def forward(
         self,
@@ -248,10 +267,24 @@ class LSTMModelInt8QAT(nn.Module):
         c_states = [x.new_zeros(B, self.hidden_size) for _ in range(self.num_layers)]
 
         outputs = []
+        prev_x = None
         # Simple unroll; kwargs are accepted to enable upstream capability detection,
         # but here we keep it straightforward for robustness/speed.
         for t in range(W):
             x_t = x[:, t, :]
+
+            # ------ MP-time: stima transiente semplice dal delta ingresso ------
+            use_fine = False
+            if self._mp_time_enabled and (prev_x is not None):
+                # tau_t = max |Δx| su batch (coarse e cheap per evitare overhead)
+                tau_t = (x_t - prev_x).abs().amax().item()
+                use_fine = (tau_t > self._mp_tau_thr)
+                # imposta griglia solo per tanh(c) di TUTTI i layer a questo timestep
+                grid = self._mp_grid_fine if use_fine else self._mp_grid_base
+                for cell in self.layers:
+                    cell.tanh_q8_c.set_grid(grid)
+            prev_x = x_t
+
             for l, cell in enumerate(self.layers):
                 h_states[l], c_states[l] = cell(x_t, (h_states[l], c_states[l]))
                 x_t = h_states[l]
@@ -272,3 +305,111 @@ class LSTMModelInt8QAT(nn.Module):
         combined = F.dropout(combined, p=self.dropout_p, training=(self.training or mc_dropout))
         out = self.fc(combined).squeeze(-1)  # (B,)
         return out
+    
+    # ------------- Quant eval: lascia attive le fake-quant anche in eval -------------
+    @contextmanager
+    def quant_eval(self, enabled: bool = True):
+        """Mantiene attiva la fake-quant anche in eval() per validazione 'INT-like'."""
+        if not enabled:
+            yield
+            return
+        prev = self._quant_eval_enabled
+        self._quant_eval_enabled = True
+        # Propaga a tutte le QLinear
+        prev_flags = []
+        for m in self.modules():
+            if isinstance(m, QLinear):
+                prev_flags.append((m, m.force_quant))
+                m.force_quant = True
+        try:
+            yield
+        finally:
+            for m, flag in prev_flags:
+                m.force_quant = flag
+            self._quant_eval_enabled = prev
+
+    # ------------- MP-time: setup leggero (solo griglia tanh(c)) -------------
+    @torch.no_grad()
+    def enable_time_mixed_precision(self, *, tau_thr: float = 0.08, scale_mul: float = 1.5, rshift_delta: int = -1):
+        """
+        Abilita una MP-temporale leggera aumentando la griglia di quantizzazione SOLO per tanh(c)
+        quando |Δx| supera la soglia. Nessun cambio di attivazioni, costo trascurabile.
+          - tau_thr: soglia su max|Δx| per timestep (coarse, batch-wide).
+          - scale_mul: fattore moltiplicativo della griglia (>=1).
+          - rshift_delta: delta shift simulato (negativo => più fine => x2^(-delta)).
+        """
+        self._mp_time_enabled = True
+        self._mp_tau_thr = float(tau_thr)
+        base = 256.0
+        grid_mul = max(1.0, float(scale_mul)) * (2.0 ** float(-int(rshift_delta)))
+        self._mp_grid_base = base
+        self._mp_grid_fine = base * grid_mul
+
+    # ------------- Export quant metadata (leggero) -------------
+    @torch.no_grad()
+    def export_quant_metadata(self) -> dict:
+        """
+        Raccoglie scale per-tensor da QLinear (attivazioni e pesi) + info attivazioni.
+        Utile per costruire header C; NON calcola mult/rshift (dipende dal tuo toolchain).
+        """
+        cells = []
+        for i, cell in enumerate(self.layers):
+            cells.append({
+                "idx": i,
+                "ih": {"Sx": float(cell.ih.qx.scale), "Sw": float(cell.ih.qw.scale), "bias_fp32": bool(cell.ih.bias is not None)},
+                "hh": {"Sx": float(cell.hh.qx.scale), "Sw": float(cell.hh.qw.scale), "bias_fp32": bool(cell.hh.bias is not None)},
+                "S_gate_q8": int(cell.sigmoid_q8.S_gate_q8),
+                "S_tanhc_q8": int(cell.tanh_q8_c.S_tanhc_q8),
+            })
+        meta = {
+            "input_size": self.input_size,
+            "hidden_size": self.hidden_size,
+            "num_layers": self.num_layers,
+            "fc": {"Sx": float(self.fc.qx.scale), "Sw": float(self.fc.qw.scale), "bias_fp32": bool(self.fc.bias is not None)},
+            "cells": cells,
+            "mp_time": {
+                "enabled": bool(self._mp_time_enabled),
+                "tau_thr": float(self._mp_tau_thr),
+                "grid_base": float(self._mp_grid_base),
+                "grid_fine": float(self._mp_grid_fine),
+            },
+        }
+        return meta
+
+    @torch.no_grad()
+    def emit_c_header(self, qmeta: dict | None = None) -> str:
+        """
+        Genera un header C minimale con define e scale (da integrare col tuo exporter pesi).
+        """
+        if qmeta is None:
+            qmeta = self.export_quant_metadata()
+        lines = []
+        push = lines.append
+        push("// Auto-generated quant header (minimal)")
+        push("#pragma once")
+        push("")
+        push(f"#define MODEL_INPUT_SIZE   {qmeta['input_size']}")
+        push(f"#define MODEL_HIDDEN_SIZE  {qmeta['hidden_size']}")
+        push(f"#define MODEL_NUM_LAYERS   {qmeta['num_layers']}")
+        push("")
+        push("// FC per-tensor scales")
+        push(f"static const float FC_SX = {qmeta['fc']['Sx']}f;")
+        push(f"static const float FC_SW = {qmeta['fc']['Sw']}f;")
+        push("")
+        push("// LSTM cells per-layer scales")
+        for c in qmeta["cells"]:
+            i = c["idx"]
+            push(f"// Layer {i}")
+            push(f"static const float L{i}_IH_SX = {c['ih']['Sx']}f;")
+            push(f"static const float L{i}_IH_SW = {c['ih']['Sw']}f;")
+            push(f"static const float L{i}_HH_SX = {c['hh']['Sx']}f;")
+            push(f"static const float L{i}_HH_SW = {c['hh']['Sw']}f;")
+            push(f"static const int   L{i}_S_GATE_Q8  = {c['S_gate_q8']};")
+            push(f"static const int   L{i}_S_TANHC_Q8 = {c['S_tanhc_q8']};")
+            push("")
+        push("// Mixed-precision temporale (griglie tanh(c))")
+        push(f"#define MP_TIME_ENABLED  {1 if qmeta['mp_time']['enabled'] else 0}")
+        push(f"static const float TANHC_GRID_BASE = {qmeta['mp_time']['grid_base']}f;")
+        push(f"static const float TANHC_GRID_FINE = {qmeta['mp_time']['grid_fine']}f;")
+        push("")
+        return "\n".join(lines)

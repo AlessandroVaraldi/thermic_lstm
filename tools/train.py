@@ -58,23 +58,17 @@ def huber(y_pred, y_true, delta=1.0):
     err  = y_pred - y_true
     mask = np.abs(err) <= delta
     return float(
-        np.mean(0.5 * err[mask]**2) +               # parte quadratica
-        np.mean(delta * (np.abs(err[~mask]) - 0.5*delta))  # parte lineare
+        np.mean(0.5 * err[mask]**2) + np.mean(delta * (np.abs(err[~mask]) - 0.5*delta))
     )
 
 def gaussian_nll(mu, sigma, y_true, eps=1e-6):
-    """
-    Neg-log-likelihood per predizioni normal-Gaussian:
-        NLL = 0.5·log(2πσ²) + 0.5·((y-μ)/σ)²
-    """
     sigma = np.clip(sigma, eps, None)
     return float(np.mean(
-        0.5 * np.log(2 * math.pi * sigma**2) +
-        0.5 * ((y_true - mu) / sigma)**2
+        0.5 * np.log(2 * math.pi * sigma**2) + 0.5 * ((y_true - mu) / sigma)**2
     ))
 
 # ---------------------------------------------------------------------
-# 4. Logging helpers (unchanged)
+# 4. Logging helpers
 # ---------------------------------------------------------------------
 def setup_logging(verbose: bool, log_dir: str = "logs") -> logging.Logger:
     """
@@ -85,7 +79,7 @@ def setup_logging(verbose: bool, log_dir: str = "logs") -> logging.Logger:
     Path(log_dir).mkdir(exist_ok=True)
     log_path = Path(log_dir) / f"training_{time.strftime('%Y%m%d_%H%M%S')}.log"
 
-    logger = logging.getLogger()          # root logger
+    logger = logging.getLogger()
     logger.setLevel(logging.INFO)
 
     for h in logger.handlers[:]:
@@ -110,10 +104,9 @@ def setup_logging(verbose: bool, log_dir: str = "logs") -> logging.Logger:
 
 
 # ---------------------------------------------------------------------
-# 5. Utility functions (unchanged)
+# 5. Utility functions
 # ---------------------------------------------------------------------
 def predict(model, dl, device):
-    """Forward pass over a DataLoader – returns stacked numpy arrays."""
     model.eval()
     preds, gts = [], []
     with torch.no_grad():
@@ -124,7 +117,6 @@ def predict(model, dl, device):
 
 
 def concat_with_pad(arr_list, pad_len):
-    """Concatenate an iterable of 1-D arrays inserting NaN padding."""
     if len(arr_list) == 0:
         return np.empty(0, dtype=float)
     pad = np.full(pad_len, np.nan, dtype=arr_list[0].dtype)
@@ -134,7 +126,6 @@ def concat_with_pad(arr_list, pad_len):
 def build_concat_dataset(
     idxs, cycles_P, cycles_Tbp, cycles_Tjr, mu_x, std_x, mu_y, std_y
 ):
-    """Builds a torch.utils.data.ConcatDataset out of selected cycle indices."""
     ds_list = []
     for i in idxs:
         X = np.column_stack([cycles_P[i], cycles_Tbp[i]])
@@ -152,9 +143,6 @@ def send_telegram_message(
     chat_id: str | None = None,
     parse_mode: str = "Markdown"
 ) -> bool:
-    """
-    Push a message to Telegram via Bot API.
-    """
     bot_token = bot_token or os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id   = chat_id   or os.getenv("TELEGRAM_CHAT_ID")
 
@@ -225,7 +213,6 @@ def main(
 
     cycles_t, cycles_P, cycles_Tbp, cycles_Tjr = [], [], [], []
 
-    # --- dt globale preso dal *primo* file (asseriamo che tutti i CSV abbiano stesso sampling)
     dt = datasets[0]["t"][1] - datasets[0]["t"][0]
     
     importlib.import_module("src.config").DT = float(dt)
@@ -242,7 +229,7 @@ def main(
         cycles_Tbp.append(cols["Tbp"].copy())
         cycles_Tjr.append(cols["Tjr"].copy())
 
-        # -------- augmentation sul singolo file
+        # -------- augmentation
         for i in range(AUG_CYCLES):
             P_aug, Tbp_aug, Tjr_aug = augment_cycle(P_orig, cols["Tbp"], cols["Tjr"])
             t_shift = (i + 1) * (cycle_span + dt)
@@ -624,7 +611,7 @@ def main(
     logger.info("NLL   – Std : %.4f   | PI : %.4f", nll_std,  nll_pi )
     logger.info("95 %% coverage – Std : %5.2f%% | PI : %5.2f%%", 100*cov_std, 100*cov_pi)
 
-    # ------------- ODE error (unchanged)
+    # ------------- ODE error
     start            = WINDOW_SIZE - 1
     t_full           = concat_with_pad([cycles_t[i] for i in idx_test], PAD)[start:]
     T_gt_full        = concat_with_pad([cycles_Tjr[i] for i in idx_test], PAD)[start:]
@@ -635,7 +622,7 @@ def main(
     T_ode_valid      = T_ode_full[mask_full]
     mse_ode          = np.mean((T_ode_valid - T_gt_valid) ** 2)
 
-    # ------------- Time stamps for NN predictions (unchanged)
+    # ------------- Time stamps for NN predictions
     t_pred_list = []
     for i in idx_test:
         t_cycle   = cycles_t[i]
@@ -648,7 +635,7 @@ def main(
     t_pred = np.concatenate(t_pred_list)
 
     # ---------------------------------------------------------------------
-    # 7) Plots (unchanged)
+    # 7) Plots
     # ---------------------------------------------------------------------
     Path(PLOT_PATH).mkdir(parents=True, exist_ok=True)
 
@@ -707,7 +694,7 @@ def main(
     logger.info("All done – plots saved in %s", PLOT_PATH)
 
     # ---------------------------------------------------------------------
-    # 8) Telegram final notification (unchanged except for new params)
+    # 8) Telegram final notification
     # ---------------------------------------------------------------------
     if use_telegram:
         msg_lines = [
@@ -740,7 +727,7 @@ def main(
 
 
 # ---------------------------------------------------------------------
-# 9. Entry point – new CLI switches
+# 9. Entry point
 # ---------------------------------------------------------------------
 if __name__ == "__main__":
     default_device = "cuda" if torch.cuda.is_available() else "cpu"

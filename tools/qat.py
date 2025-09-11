@@ -1,21 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-QAT training for integer-only Attention PI-LSTM — optimized & PI-consistent
-
-Novità principali di questa versione:
-  • Usa il dt **misurato dai CSV** per il residuo transiente (non il DT fisso).
-  • Mantiene il "single-pass twin-window" (ŷ_t e ŷ_{t-1} in un solo forward).
-  • AMP con dtype selezionabile (bf16|fp16), accumulo gradienti, TBPTT/ckpt opzionali.
-  • Validazione intermittenza + limite batch; DataLoader ottimizzati; torch.compile.
-
-Esecuzione tipica:
-  export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-  python qlstm_train.py --augment 2 --batch 16 --amp 1 --amp-dtype bf16 --ckpt 0 \
-    --tbptt-k 0 --accum 2 --workers 8 --pin-memory 1 --persist 1 --prefetch 4 \
-    --val-interval 1 --val-max-batches 0 --warmup 0
-"""
-
 from __future__ import annotations
 import argparse, json, os, time, math, inspect
 from dataclasses import dataclass
@@ -33,7 +15,7 @@ from contextlib import nullcontext
 # ---------------- project-local ----------------
 from src.config import (
     CSV_DIR, CSV_GLOB, INPUT_SIZE, HIDDEN_SIZE, NUM_LAYERS,
-    TRAIN_FRAC, VAL_FRAC, WINDOW_SIZE, DT,                    # DT rimane per compat ma non usato nel residuo
+    TRAIN_FRAC, VAL_FRAC, WINDOW_SIZE, DT,
     LAMBDA_SS, LAMBDA_TR, LAMBDA_WARMUP_EPOCHS,
     SEED, MAX_EPOCHS, PATIENCE, BATCH_SIZE, LEARNING_RATE,
     RTH_C, RTH_V, C_TH, T_ENV, PLOT_DPI, AUG_CYCLES
@@ -121,7 +103,7 @@ def evaluate_epoch(model, dl, device, mu_y, std_y, *, amp_enabled: bool, amp_dty
             if max_batches is not None and i >= max_batches:
                 break
             xb = xb.to(device); yb = yb.to(device)
-            y_hat = model(xb)  # in eval niente TBPTT/ckpt per metrica coerente
+            y_hat = model(xb)
             tot += Fnn.mse_loss(y_hat, yb, reduction="sum").item()
             n   += yb.numel()
             preds.append((y_hat.float().cpu().numpy() * std_y + mu_y))
@@ -135,7 +117,7 @@ def train_qat(
     model, dl_train, dl_val, device,
     mu_x, std_x, mu_y, std_y,
     *,  # only keyword args below
-    dt: float,                                     # <-- dt misurato (in secondi)
+    dt: float,
     lambda_ss=LAMBDA_SS, lambda_tr=LAMBDA_TR,
     lr=LEARNING_RATE, max_epochs=MAX_EPOCHS, patience=PATIENCE,
     warmup_epochs=LAMBDA_WARMUP_EPOCHS,
@@ -144,13 +126,13 @@ def train_qat(
     pin: bool = True, accum: int = 1, val_interval: int = 1, val_max_batches: int | None = None,
     use_fused_adam: bool = True
 ):
-    # Optimizer (fused se disponibile)
+    # Optimizer
     try:
         opt = torch.optim.Adam(model.parameters(), lr=lr, fused=bool(use_fused_adam))
     except TypeError:
         opt = torch.optim.Adam(model.parameters(), lr=lr)
     
-    # GradScaler solo per FP16
+    # GradScaler
     scaler = GradScaler(enabled=(amp_enabled and amp_dtype == torch.float16))
     devtype = _devtype_from_device(device)
 
@@ -184,7 +166,7 @@ def train_qat(
                 xb = xb.to(device, non_blocking=pin)
                 yb = yb.to(device, non_blocking=pin)
 
-                # Single-pass twin-window: concateniamo (curr, prev) sul batch
+                # Single-pass twin-window
                 xb_prev = torch.cat([xb[:, :1, :], xb[:, :-1, :]], dim=1)
                 xcat    = torch.cat([xb, xb_prev], dim=0)
 
@@ -197,7 +179,7 @@ def train_qat(
                     y_hat_deg  = y_hat * std_y_t + mu_y_t       # °C
                     loss_data  = Fnn.mse_loss(y_hat, yb)
 
-                    # ---- de-normalizza P,Tbp (ultimo e penultimo passo finestra)
+                    # ---- de-normalize last time-step of current window
                     x_last = xb[:, -1, :]                      # (B,2) normalized
                     P_c    = x_last[:, 0] * std_x_t[0] + mu_x_t[0]
                     Tbp_c  = x_last[:, 1] * std_x_t[1] + mu_x_t[1]
@@ -207,7 +189,7 @@ def train_qat(
                         Tss = T_steady_state(P_c, Tbp_c, T_ENV, RTH_C, RTH_V)  # °C
                         loss_ss = Fnn.mse_loss(y_hat_deg, Tss)
 
-                    # ---- residuo transiente (SOLO predizioni; usa dt misurato)
+                    # ---- transient residual
                     if WINDOW_SIZE >= 2 and lam_tr > 0:
                         T_prev_deg = T_prev * std_y_t + mu_y_t
 
@@ -226,7 +208,7 @@ def train_qat(
                     if accum > 1:
                         loss = loss / accum
 
-                # backward/step con accumulo
+                # backward/step + optimisation
                 scaler.scale(loss).backward()
                 step_mod += 1
                 if (step_mod % accum) == 0:
@@ -241,7 +223,7 @@ def train_qat(
 
             train_avg = loss_sum / max(1, n_batches)
 
-            # ---------------- VAL (intermittente) ----------------
+            # ---------------- VAL  ----------------
             do_val = (epoch % max(1, val_interval)) == 0
             if do_val:
                 _cm = model.quant_eval(True) if hasattr(model, "quant_eval") else nullcontext()
@@ -268,7 +250,7 @@ def train_qat(
                 patience_left -= 1
                 tag = " "
             else:
-                tag = "·"  # nessuna val questa epoch
+                tag = "·"
 
             ep_dt = time.perf_counter() - ep_t0
             print(
@@ -343,10 +325,10 @@ def main():
     ap.add_argument("--persist", type=int, default=1, help="persist worker processes (0/1)")
     ap.add_argument("--prefetch", type=int, default=4, help="number of batches to prefetch")
     # mixed-precision temporale (leggero: solo scaling/rshift, nessun cambio attivazioni)
-    ap.add_argument("--mp-time", type=int, default=0, help="mixed-precision temporale (0/1)")
-    ap.add_argument("--mp-tau-thr", type=float, default=0.08, help="soglia transiente")
-    ap.add_argument("--mp-scale-mul", type=float, default=1.5, help="fattore scala profilo fine")
-    ap.add_argument("--mp-rshift-delta", type=int, default=-1, help="delta rshift profilo fine")
+    ap.add_argument("--mp-time", type=int, default=0, help="temporale mixed precision (0/1)")
+    ap.add_argument("--mp-tau-thr", type=float, default=0.08, help="transient threshold (°C/s)")
+    ap.add_argument("--mp-scale-mul", type=float, default=1.5, help="scale factor for S_gate in mp-time")
+    ap.add_argument("--mp-rshift-delta", type=int, default=-1, help="delta right-shift for S_gate in mp-time")
 
     args = ap.parse_args()
 
@@ -358,18 +340,16 @@ def main():
         raise FileNotFoundError(f"Nessun CSV trovato in {CSV_DIR} (glob: {CSV_GLOB})")
 
     cycles_t, cycles_P, cycles_Tbp, cycles_Tjr = [], [], [], []
-    # dt misurato robusto: mediana per file; warning se non uniforme
     dts = [float(np.median(np.diff(cols["t"]))) for cols in datasets]
     dt = float(np.median(dts))
     if (max(dts) - min(dts)) > 1e-6:
-        print(f"[warn] dt non uniforme tra CSV — median={dt:.9f}, range=[{min(dts):.9f},{max(dts):.9f}]")
+        print(f"[warn] dt not uniform across CSVs — median={dt:.9f}, range=[{min(dts):.9f},{max(dts):.9f}]")
 
     for cols in datasets:
         P = compute_powers(cols["Id"], cols["Iq"])
         cycles_t.append(cols["t"]); cycles_P.append(P); cycles_Tbp.append(cols["Tbp"]); cycles_Tjr.append(cols["Tjr"])
         for _ in range(max(0, args.augment)):
             P2, Tbp2, Tjr2 = augment_cycle(P, cols["Tbp"], cols["Tjr"])
-            # shift temporale solo per plotting cumulativo/ODE
             shift = (cycles_t[-1][-1] - cycles_t[-1][0]) + dt
             cycles_t.append(cols["t"] + shift)
             cycles_P.append(P2); cycles_Tbp.append(Tbp2); cycles_Tjr.append(Tjr2)
@@ -377,7 +357,7 @@ def main():
     n_cycles = len(cycles_P)
     split = split_cycles(n_cycles, args.train_frac, args.val_frac, args.seed)
 
-    # ------------ stats (solo train) ------------
+    # ------------ stats (train only) ------------
     PAD = WINDOW_SIZE - 1
     def cat_with_pad(arrs):
         pad = np.full(PAD, np.nan, dtype=float)
@@ -425,7 +405,7 @@ def main():
         S_tanhc_q8=int(args.S_tanhc_q8),
     ).to(device)
 
-    # mixed-precision temporale (se supportato dal modello; costo ~nullo)
+    # temporal mixed precision
     if int(args.mp_time):
         if hasattr(model, "enable_time_mixed_precision"):
             try:
@@ -434,13 +414,13 @@ def main():
                     scale_mul=float(args.mp_scale_mul),
                     rshift_delta=int(args.mp_rshift_delta)
                 )
-                print(f"[mp-time] abilitato: tau_thr={args.mp_tau_thr}, scale_mul={args.mp_scale_mul}, rshift_delta={args.mp_rshift_delta}")
+                print(f"[mp-time] enabled: tau_thr={args.mp_tau_thr}, scale_mul={args.mp_scale_mul}, rshift_delta={args.mp_rshift_delta}")
             except Exception as e:
                 print(f"[mp-time] skipped: {e}")
         else:
-            print("[mp-time] modello non supporta enable_time_mixed_precision(), skipped")
+            print("[mp-time] model does not support enable_time_mixed_precision(), skipped")
 
-    # torch.compile (opzionale)
+    # torch.compile (optional)
     if int(args.compile):
         try:
             model = torch.compile(model, mode="reduce-overhead")
@@ -454,7 +434,7 @@ def main():
     model, hist, best_val = train_qat(
         model, dl_tr, dl_va, device,
         mu_x=mu_x, std_x=std_x, mu_y=mu_y, std_y=std_y,
-        dt=dt,  # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+        dt=dt,
         lambda_ss=args.lambda_ss, lambda_tr=args.lambda_tr,
         lr=args.lr, max_epochs=args.epochs, patience=PATIENCE, warmup_epochs=args.warmup,
         amp_enabled=bool(args.amp), amp_dtype=amp_dtype,
@@ -467,16 +447,16 @@ def main():
     best_path = CKPT_DIR/"best_qat.pth"; last_path = CKPT_DIR/"last_qat.pth"
     torch.save({"model": model.state_dict()}, best_path)
     torch.save({"model": model.state_dict()}, last_path)
-    # ---- export per inference C (opzionale, se il modello lo supporta) ----
+
     try:
         if hasattr(model, "export_quant_metadata"):
             qmeta = model.export_quant_metadata()
             (CKPT_DIR/"quant_meta.json").write_text(json.dumps(qmeta, indent=2))
-            print(f"[export quant] quant_meta.json salvato")
+            print(f"[export quant] quant_meta.json saved")
         if hasattr(model, "emit_c_header"):
             hdr = model.emit_c_header(qmeta if 'qmeta' in locals() else None)
             (CKPT_DIR/"model_quant.h").write_text(hdr)
-            print(f"[export quant] model_quant.h salvato")
+            print(f"[export quant] model_quant.h saved")
     except Exception as e:
         print(f"[export quant] skipped: {e}")
 
@@ -497,7 +477,100 @@ def main():
     print(f"RMSE: {test_rmse:.6f}")
     print(f"R²  : {test_r2:.4f}")
 
-    # ------------ ODE baseline (per confronto) ------------
+    # ------------ EXPORT INT8 (for inference) ------------
+    try:
+        import numpy as _np
+        if hasattr(model, "calibrate_preact_scales"):
+            pre_scales = model.calibrate_preact_scales(dl_va, device, max_batches=8)
+        else:
+            raise RuntimeError("model.calibrate_preact_scales() missing")
+
+        bin_path = CKPT_DIR/"model_int8.bin"
+        json_path = CKPT_DIR/"model_int8.json"
+        offsets = {"layers": [], "fc": {}}
+        pkg = {
+            "format": "INT8-LSTM-v1",
+            "layers": [],
+            "fc": {},
+            "pre_scales": pre_scales,  # S_pre(gate)=amax/127 (fp float)
+            "norm": {"mu_x": mu_x.tolist(), "std_x": std_x.tolist(), "mu_y": mu_y, "std_y": std_y},
+        }
+
+        off_bytes = 0
+        def _write_arr(fh, tensor, dtype):
+            nonlocal off_bytes
+            arr = tensor.detach().cpu().numpy().astype(dtype, copy=False)
+            data = arr.tobytes(order="C")
+            start = off_bytes
+            fh.write(data)
+            off_bytes += len(data)
+            return start, len(data)
+
+        with open(bin_path, "wb") as fh:
+            for li, cell in enumerate(model.layers):
+                layer_entry = {"idx": li, "ih": {}, "hh": {}, "S_gate_q8": int(cell.sigmoid_q8.S_gate_q8),
+                               "S_tanhc_q8": int(cell.tanh_q8_c.S_tanhc_q8),
+                               "pre_scales": pre_scales[li]}
+                offsets["layers"].append({"idx": li})
+
+                # ---- IH ----
+                if not hasattr(model, "quantize_linear_int8") or not hasattr(model, "compute_requant"):
+                    raise RuntimeError("quantize_linear_int8/compute_requant missing from model")
+                ih_W, ih_b, ih_Sx, ih_Sw = model.quantize_linear_int8(cell.ih)
+                layer_entry["ih"]["W_shape"] = list(ih_W.shape)  # [4H, in]
+                w_off, w_nbytes = _write_arr(fh, ih_W, _np.int8)
+                offsets["layers"][-1]["ih_W_off"] = int(w_off)
+                offsets["layers"][-1]["ih_W_nbytes"] = int(w_nbytes)
+                if cell.ih.bias is not None:
+                    b_off, b_nbytes = _write_arr(fh, ih_b, _np.int32)
+                    offsets["layers"][-1]["ih_b_off"] = int(b_off)
+                    offsets["layers"][-1]["ih_b_nbytes"] = int(b_nbytes)
+                layer_entry["ih"]["Sx"] = float(ih_Sx); layer_entry["ih"]["Sw"] = float(ih_Sw)
+
+                rq_ih = {}
+                for k in ("i","f","g","o"):
+                    m, r = model.compute_requant(ih_Sx, ih_Sw, pre_scales[li][k])
+                    rq_ih[k] = {"mult_q15": int(m), "rshift": int(r)}
+                layer_entry["ih"]["requant"] = rq_ih
+
+                # ---- HH ----
+                hh_W, hh_b, hh_Sx, hh_Sw = model.quantize_linear_int8(cell.hh)
+                layer_entry["hh"]["W_shape"] = list(hh_W.shape)  # [4H, H]
+                w_off, w_nbytes = _write_arr(fh, hh_W, _np.int8)
+                offsets["layers"][-1]["hh_W_off"] = int(w_off)
+                offsets["layers"][-1]["hh_W_nbytes"] = int(w_nbytes)
+                if cell.hh.bias is not None:
+                    b_off, b_nbytes = _write_arr(fh, hh_b, _np.int32)
+                    offsets["layers"][-1]["hh_b_off"] = int(b_off)
+                    offsets["layers"][-1]["hh_b_nbytes"] = int(b_nbytes)
+                layer_entry["hh"]["Sx"] = float(hh_Sx); layer_entry["hh"]["Sw"] = float(hh_Sw)
+                rq_hh = {}
+                for k in ("i","f","g","o"):
+                    m, r = model.compute_requant(hh_Sx, hh_Sw, pre_scales[li][k])
+                    rq_hh[k] = {"mult_q15": int(m), "rshift": int(r)}
+                layer_entry["hh"]["requant"] = rq_hh
+
+                pkg["layers"].append(layer_entry)
+
+            # FC (head)
+            fc_W, fc_b, fc_Sx, fc_Sw = model.quantize_linear_int8(model.fc) if hasattr(model, "quantize_linear_int8") else (None,None,None,None)
+            if fc_W is None:
+                raise RuntimeError("quantize_linear_int8() mancante per FC")
+            pkg["fc"]["W_shape"] = list(fc_W.shape)  # [1, 2H]
+            w_off, w_nbytes = _write_arr(fh, fc_W, _np.int8)
+            offsets["fc"]["W_off"] = int(w_off); offsets["fc"]["W_nbytes"] = int(w_nbytes)
+            if model.fc.bias is not None:
+                b_off, b_nbytes = _write_arr(fh, fc_b, _np.int32)
+                offsets["fc"]["b_off"] = int(b_off); offsets["fc"]["b_nbytes"] = int(b_nbytes)
+            pkg["fc"]["Sx"] = float(fc_Sx); pkg["fc"]["Sw"] = float(fc_Sw)
+
+        pkg["offsets"] = offsets
+        (json_path).write_text(json.dumps(pkg, indent=2))
+        print(f"[export int8] saved: {bin_path}, {json_path}")
+    except Exception as e:
+        print(f"[export int8] skipped: {e}")
+
+    # ------------ ODE baseline (for comparison) ------------
     T_ode_list, ode_time_tot = [], 0.0
     for i in split.test:
         T_ode_i, ode_time = solve_reference_ode(cycles_t[i], cycles_P[i], cycles_Tbp[i])
@@ -523,9 +596,7 @@ def main():
         "fused_adam": int(args.fused_adam)
     }
     (CKPT_DIR/"meta_qat.json").write_text(json.dumps(meta, indent=2))
-    print(f"\nSalvati: {best_path}, {last_path}, {CKPT_DIR/'meta_qat.json'}")
+    print(f"\nSaved: {best_path}, {last_path}, {CKPT_DIR/'meta_qat.json'}")
 
 if __name__ == "__main__":
     main()
-
-# python qlstm_train.py --augment 2 --batch 16 --accum 1 --amp 1 --amp-dtype fp16 --workers 8 --pin-memory 1 --persist 1 --prefetch 4 --val-interval 1 --val-max-batches 0

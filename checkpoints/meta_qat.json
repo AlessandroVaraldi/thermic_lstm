@@ -5,23 +5,23 @@
   "dropout": 0.1,
   "S_gate_q8": 32,
   "S_tanhc_q8": 64,
-  "epochs": 1000,
+  "epochs": 100,
   "batch": 16,
-  "lr": 0.0001,
+  "lr": 0.001,
   "lambda_ss": 9.78e-06,
   "lambda_tr": 2.15e-06,
   "warmup": 10,
   "mu_x": [
-    0.8811216354370117,
-    58.65823745727539
+    0.8855161070823669,
+    58.22549819946289
   ],
   "std_x": [
-    5.819507122039795,
-    14.437607765197754
+    5.880828380584717,
+    14.474271774291992
   ],
-  "mu_y": 58.293758392333984,
-  "std_y": 19.514711380004883,
-  "dt_measured": 0.1000000000003638,
+  "mu_y": 57.8629035949707,
+  "std_y": 19.503395080566406,
+  "dt_measured": 0.10000000000002274,
   "DT_config": 0.01,
   "splits": {
     "train": [
@@ -41,19 +41,24 @@
     ]
   },
   "metrics": {
-    "val_best_mse": 0.012451299716057272,
-    "test_mse": 0.010636676292944033,
-    "test_mae": 1.501502513885498,
-    "test_rmse": 2.0126353721818124,
-    "test_r2": 0.9919294714927673
+    "val_best_mse": Infinity,
+    "test_mse": 1.540139496069964,
+    "test_mae": 19.154354095458984,
+    "test_rmse": 24.204172780338286,
+    "test_r2": -0.19339394569396973
   },
   "amp": true,
-  "amp_dtype": "fp16",
+  "amp_dtype": "bf16",
   "ckpt": false,
   "ckpt_chunk": 16,
   "tbptt_k": 0,
-  "accum": 1,
+  "accum": 2,
   "val_interval": 1,
   "val_max_batches": null,
-  "compile": 0
+  "compile": 0,
+  "mp_time": 1,
+  "mp_tau_thr": 0.08,
+  "mp_scale_mul": 1.5,
+  "mp_rshift_delta": -1,
+  "fused_adam": 1
 }

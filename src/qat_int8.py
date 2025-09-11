@@ -413,3 +413,81 @@ class LSTMModelInt8QAT(nn.Module):
         push(f"static const float TANHC_GRID_FINE = {qmeta['mp_time']['grid_fine']}f;")
         push("")
         return "\n".join(lines)
+    
+    @torch.no_grad()
+    def calibrate_preact_scales(self, dl, device, max_batches=8):
+        """
+        Pass veloce su dl per stimare gli amax dei pre-attivazioni gate per layer.
+        Restituisce: list[dict] con chiavi 'i','f','g','o' -> amax float.
+        Usa i pesi quantizzati (quant_eval) se possibile.
+        """
+        # init running amax
+        stats = [{"i":0.0,"f":0.0,"g":0.0,"o":0.0} for _ in range(self.num_layers)]
+        def _update(layer_idx, i,f,g,o):
+            s = stats[layer_idx]
+            s["i"] = max(s["i"], float(i.detach().abs().amax().cpu()))
+            s["f"] = max(s["f"], float(f.detach().abs().amax().cpu()))
+            s["g"] = max(s["g"], float(g.detach().abs().amax().cpu()))
+            s["o"] = max(s["o"], float(o.detach().abs().amax().cpu()))
+
+        # leggero hook locale: ricalcola gates dentro
+        from contextlib import nullcontext
+        cm = self.quant_eval(True) if hasattr(self, "quant_eval") else nullcontext()
+        with cm:
+            self.eval()
+            n = 0
+            for xb, yb in dl:
+                xb = xb.to(device)
+                B, W, _ = xb.shape
+                # stati
+                h = [xb.new_zeros(B, self.hidden_size) for _ in range(self.num_layers)]
+                c = [xb.new_zeros(B, self.hidden_size) for _ in range(self.num_layers)]
+                for t in range(W):
+                    x_t = xb[:,t,:]
+                    for L, cell in enumerate(self.layers):
+                        gates = cell.ih(x_t) + cell.hh(h[L])  # (B,4H)
+                        i,f,g,o = gates.chunk(4, dim=1)
+                        _update(L, i,f,g,o)
+                        # step normale
+                        i = cell.sigmoid_q8(i); f = cell.sigmoid_q8(f); g = cell.tanh_q8_g(g); o = cell.sigmoid_q8(o)
+                        c[L] = f * c[L] + i * g
+                        if cell.c_clamp is not None:
+                            c[L] = torch.clamp(c[L], -cell.c_clamp, cell.c_clamp)
+                        h[L] = o * cell.tanh_q8_c(c[L])
+                        x_t  = h[L]
+                n += 1
+                if n >= max_batches: break
+
+        # converti in scale per int8 simmetriche (zero-point 0)
+        pre_scales = []
+        for s in stats:
+            pre_scales.append({k: (max(1e-8, s[k])/127.0) for k in ("i","f","g","o")})
+        return pre_scales
+
+    @torch.no_grad()
+    def quantize_linear_int8(self, lin: nn.Module):
+        """Ritorna (W_s8, bias_i32, Sx, Sw) usando le scale dei FakeQuant del layer."""
+        Sx = float(lin.qx.scale); Sw = float(lin.qw.scale)
+        W  = torch.clamp(torch.round(lin.weight / Sw), -127, 127).to(torch.int8).contiguous()
+        if lin.bias is not None:
+            b_i32 = torch.round(lin.bias / (Sx*Sw)).to(torch.int32).contiguous()
+        else:
+            b_i32 = torch.zeros(lin.out_features, dtype=torch.int32)
+        return W, b_i32, Sx, Sw
+
+    @torch.no_grad()
+    def compute_requant(self, Sx, Sw, S_pre, bits=15):
+        """
+        Calcola (mult_q15, rshift) per out_int = sat(((sum_i32) * mult_q15) >> rshift),
+        approssimando (Sx*Sw / S_pre).
+        """
+        target = (Sx*Sw) / max(1e-12, S_pre)
+        # porta target in forma m/2^r con m ~ Q15
+        rshift = max(0, int(math.ceil(max(0.0, math.log2(target))) - 14))  # cerca rshift piccolo
+        m = int(round(target * (1<<rshift)))
+        # ricentra m su Q15 se troppo grande/piccolo
+        while m >= (1<<15): m >>= 1; rshift -= 1
+        while m <  (1<<14): m <<= 1; rshift += 1
+        m = max(1, min((1<<15)-1, m))
+        return m, rshift
+

@@ -1,8 +1,3 @@
-"""
-Physical helper functions (ODE and steady-state temperature).
-Keep all physics-based utilities in one place.
-"""
-
 import numpy as np
 
 def thermal_ode(T, t, t_data, P_data, Tbp_data, Tenv_data, RthC, RthV, Cth):
@@ -32,28 +27,7 @@ def transient_residual(T_prev, T_curr,
                        P_prev, P_curr,
                        Tbp_prev, Tbp_curr,
                        dt, RthC, RthV, Cth, Tenv):
-    """
-    Residual of the single-RC ODE evaluated over one time-step.
-
-    Parameters
-    ----------
-    T_prev, T_curr : torch.Tensor
-        Predicted junction temperature at *t-Δt* and *t*  (shape: B).
-    P_prev, P_curr : torch.Tensor
-        Net power at the two instants                        (shape: B).
-    Tbp_prev, Tbp_curr : torch.Tensor
-        Base-plate temperature at the two instants           (shape: B).
-    dt : float
-        Sampling period [s].
-    RthC, RthV, Cth, Tenv : float
-        Physical parameters of the thermal network.
-
-    Returns
-    -------
-    torch.Tensor
-        Residual r = dT/dt − f(T, P, Tbp)   (shape: B).
-    """
-    import torch  # local import avoids cyclic deps
+    import torch  # local import to avoid circular dependency
 
     dTdt_pred = (T_curr - T_prev) / dt
     rhs = (P_curr

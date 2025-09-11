@@ -1,8 +1,3 @@
-"""
-Training loop shared by both standard and physics-informed models
-with optional mixed-precision (AMP) support.
-"""
-
 import logging
 from copy import deepcopy
 from pathlib import Path
@@ -20,8 +15,6 @@ from src.config import (
     RTH_C, RTH_V, C_TH, T_ENV, DT,
     LAMBDA_WARMUP_EPOCHS                    # NEW
 )
-
-
 
 def train_model(
     model,

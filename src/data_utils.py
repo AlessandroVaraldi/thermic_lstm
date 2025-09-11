@@ -113,19 +113,9 @@ def solve_reference_ode(t, P, Tbp) -> tuple[np.ndarray, float]:
 from numpy.lib.stride_tricks import sliding_window_view
 
 def sliding_windows(data_in: np.ndarray, data_out: np.ndarray):
-    """
-    Convert (T, N_features) + (T,) → (N_windows, WINDOW_SIZE, N_features) + (N_windows,).
-    Vectorized implementation using NumPy sliding_window_view.
-    """
-    # data_in: (T, F), data_out: (T,)
-    # sliding along time axis (axis=0):
-    # windows shape → (T-WINDOW_SIZE+1, WINDOW_SIZE, F)
-    # windows: dovrebbe essere (N_windows, WINDOW_SIZE, N_features)
     windows = sliding_window_view(data_in, window_shape=WINDOW_SIZE, axis=0)
-    # Se invece è (N_windows, N_features, WINDOW_SIZE), inverti gli ultimi due assi
     if windows.ndim == 3 and windows.shape[1] != WINDOW_SIZE:
         windows = windows.transpose(0, 2, 1)
-    # targets aligned to end of each window
     targets = data_out[WINDOW_SIZE - 1 :]
     return windows, targets
 
@@ -141,21 +131,7 @@ def augment_cycle(
     jitter_max:  int   = JITTER_SAMPLES,
     rng=np.random.default_rng(),
 ):
-    """
-    Physical-aware duty-cycle augmentation.
-
-    1) **Jitter temporale** – roll di ±`jitter_max` campioni applicato
-       in blocco a P, Tbp e Tjr (mantiene la coerenza fra canali).
-    2) **Offset termico quasi-statico** – sposta Tbp e Tjr di ΔT ~ N(0, σ²)
-       per simulare variazioni lente dell’ambiente.
-    3) **Scaling di potenza** – fattore N(1, scale_std²).
-    4) **Rumore a somma-zero** su P – preserva l’integrale ∫P dt (energia),
-       quindi non altera la dinamica globale del transiente.
-    5) **Rumore bianco** su Tbp/Tjr come prima.
-
-    Restituisce: tuple (P_aug, Tbp_aug, Tjr_aug) con stessa shape originale.
-    """
-    # ---------- 1) jitter temporale (roll)
+    # ---------- 1) temporal jitter
     shift = int(rng.integers(-jitter_max, jitter_max + 1))
     P_aug, Tbp_aug, Tjr_aug = (
         np.roll(P,   shift),
@@ -163,21 +139,21 @@ def augment_cycle(
         np.roll(Tjr, shift),
     )
 
-    # ---------- 2) offset termico quasi-statico
+    # ---------- 2) quasi-static thermal offset
     dT = rng.normal(0.0, offset_std)
     Tbp_aug += dT
     Tjr_aug += dT
 
-    # ---------- 3) scaling globale di potenza
-    amp = rng.normal(1.0, scale_std)          # ≈ ±5 %
+    # ---------- 3) global power scaling
+    amp = rng.normal(1.0, scale_std)
     P_aug *= amp
 
-    # ---------- 4) rumore a somma-zero (conserva energia)
+    # ---------- 4) zero-sum noise (preserves energy)
     noise_P = rng.normal(0.0, noise_std * P_aug.std(), size=P_aug.shape)
-    noise_P -= noise_P.mean()                 # ∑ noise_P = 0
+    noise_P -= noise_P.mean()
     P_aug += noise_P
 
-    # ---------- 5) rumore su temperature (come prima)
+    # ---------- 5) white noise on temperatures
     noise_bp = rng.normal(0.0, noise_std * Tbp_aug.std(), size=Tbp_aug.shape)
     noise_jr = rng.normal(0.0, noise_std * Tjr_aug.std(), size=Tjr_aug.shape)
     Tbp_aug += noise_bp
@@ -188,21 +164,13 @@ def augment_cycle(
 
 @torch.no_grad()
 def predict_mc(model, dataloader, n_samples=30, device="cpu"):
-    """
-    Monte-Carlo Dropout inference.
-
-    Returns
-    -------
-    mean : np.ndarray, shape (N,)
-    std  : np.ndarray, shape (N,)
-    """
-    model.eval()                     # BatchNorm resterebbe in eval (qui non lo usiamo)
+    model.eval()
     preds = []
     for _ in range(n_samples):
         single_pass = []
         for xb, _ in dataloader:
             xb = xb.to(device)
-            yb = model(xb, mc_dropout=True)     # <-- abilita dropout
+            yb = model(xb, mc_dropout=True)
             single_pass.append(yb.cpu())
         preds.append(torch.cat(single_pass))
     stack = torch.stack(preds)        # (S, N)

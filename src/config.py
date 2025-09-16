@@ -147,7 +147,7 @@ PERSIST    = True
 PREFETCH   = 4
 
 # Temporal mixed-precision (time-aware scaling only)
-MP_TIME         = 0          # 0/1
+MP_TIME         = 1          # 0/1
 MP_TAU_THR      = 0.08       # °C/s threshold
 MP_SCALE_MUL    = 1.5        # scale factor for S_gate in mp-time
 MP_RSHIFT_DELTA = -1         # delta rshift for S_gate in mp-time

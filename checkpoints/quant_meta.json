@@ -25,9 +25,9 @@
     }
   ],
   "mp_time": {
-    "enabled": true,
+    "enabled": false,
     "tau_thr": 0.08,
     "grid_base": 256.0,
-    "grid_fine": 768.0
+    "grid_fine": 512.0
   }
 }

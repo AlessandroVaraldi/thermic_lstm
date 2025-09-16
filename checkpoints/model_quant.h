@@ -19,6 +19,6 @@ static const int   L0_S_GATE_Q8  = 32;
 static const int   L0_S_TANHC_Q8 = 64;
 
 // Mixed-precision temporale (griglie tanh(c))
-#define MP_TIME_ENABLED  1
+#define MP_TIME_ENABLED  0
 static const float TANHC_GRID_BASE = 256.0f;
-static const float TANHC_GRID_FINE = 768.0f;
+static const float TANHC_GRID_FINE = 512.0f;

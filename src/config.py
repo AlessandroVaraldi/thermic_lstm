@@ -16,111 +16,141 @@ CSV_GLOB = "*.csv"                    # str
 # Directory where PNG plots (e.g. training curves, inference results)
 # will be stored. The directory will be created if it does not exist.
 PLOT_PATH = "plots/"  # str
+# Alias used by some modules
+PLOTS_DIR = PLOT_PATH  # str
 
-# Resolution of the plots saved in `PLOT_PATH`. The resolution is
-# specified as a dpi value, which is the number of pixels per inch.
+# Resolution of the plots saved in `PLOT_PATH`/`PLOTS_DIR`
 PLOT_DPI = 300  # int
 
 # --------------------------------------------------------------------
 # Data-set parameters
 # --------------------------------------------------------------------
-# Length (in time-steps) of each sliding window fed to the LSTM. A
-# window of 64 samples roughly corresponds to ~6 seconds of data.
+# Length (in time-steps) of each sliding window fed to the LSTM.
 WINDOW_SIZE = 64  # int
 
-# Fractions used to split *time-ordered* data into train/val/test. The
-# remaining 10 % (1 - TRAIN_RATIO - VAL_RATIO) is implicitly the test
-# share. Ratios are applied after optional augmentations.
+# Fractions used to split *time-ordered* data into train/val/test.
 TRAIN_RATIO = 0.70  # float in [0,1]
 VAL_RATIO   = 0.20  # float in [0,1]
+
+# Fractions used when splitting *cycles* after augmentation.
+TRAIN_FRAC = 0.70   # float in [0,1]
+VAL_FRAC   = 0.15   # float in [0,1]
 
 # --------------------------------------------------------------------
 # Model architecture parameters
 # --------------------------------------------------------------------
-# Number of features per time-step: here we feed net power (P_net) and
-# base-plate temperature (Tbp) → 2 features in total.
-INPUT_SIZE  = 2   # int
+# Input features per time-step (P_net, Tbp)
+INPUT_SIZE  = 2    # int
+# LSTM hidden size
+HIDDEN_SIZE = 16   # int
+# Output features (we predict a single scalar)
+OUTPUT_SIZE = 1    # int
+# Stacked LSTM layers
+NUM_LAYERS  = 1    # int
+# Dropout probability inside the LSTM/heads
+DROPOUT     = 0.10 # float in [0,1]
 
-# Hidden state size of the LSTM layer. Larger values boost model
-# capacity at the cost of more parameters and slower inference.
-HIDDEN_SIZE = 16  # int
-
-# Number of features in the output layer. We predict a single scalar
-# value (junction temperature) at each time-step, so this is 1.
-OUTPUT_SIZE = 1   # int
-
-# How many stacked LSTM layers to use.
-NUM_LAYERS  = 1   # int
-
-# Scaling factor applied to the physics-informed penalties (steady-state
-# loss).
+# --------------------------------------------------------------------
+# Physics-informed losses
+# --------------------------------------------------------------------
+# Steady-state loss weight
 LAMBDA_SS = 9.78e-6  # float ≥ 0
-# Scaling factor applied to the thermal resistance loss.
+# Transient residual loss weight
 LAMBDA_TR = 2.15e-6  # float ≥ 0
 
-# --------------------------------------------------------------------
-# NEW: scheduler warm-up
-# --------------------------------------------------------------------
-# Number of epochs over which λ_ss and λ_tr ramp up linearly
-# from 0 → λ_max. 0 = scheduler disabilitato (comportamento attuale).
-LAMBDA_WARMUP_EPOCHS = 10  # int ≥ 0
+# Warm-up (λ ramp-up from 0 → target)
+LAMBDA_WARMUP_EPOCHS = 10  # int ≥ 0 (0 disables ramp-up)
 
 # --------------------------------------------------------------------
 # Training hyper-parameters
 # --------------------------------------------------------------------
-SEED          = 97     # int – global random seed for reproducibility
-MAX_EPOCHS    = 1000   # int – upper bound on training epochs
-EPOCHS        = 100
-PATIENCE      = 10     # int – early-stopping patience on validation loss
-BATCH_SIZE    = 8      # int – number of windows per mini-batch
-LEARNING_RATE = 1e-4   # float – initial LR for the Adam optimiser
+SEED          = 97     # int
+MAX_EPOCHS    = 1000   # int
+EPOCHS        = 100    # legacy, may be unused
+PATIENCE      = 10     # int
+BATCH_SIZE    = 16     # int
+LEARNING_RATE = 1e-3   # float
 
 # --------------------------------------------------------------------
 # Physical constants
 # --------------------------------------------------------------------
-# Thermal resistance [K/W] from junction → case.
-RTH_C = 1.65      # float (Kelvin per Watt)
-# Thermal resistance [K/W] from junction → ambient.
-RTH_V = 1e5       # float (Kelvin per Watt)
-# Lumped thermal capacitance [J/K] of the chip package.
-C_TH  = 1.5       # float (Joule per Kelvin)
-# Ambient (coolant) temperature [°C].
-T_ENV = 20.0      # float (degree Celsius)
-# Drain-source on-state resistance of the MOSFET [Ω]
-R_DSON = 0.63e-3  # float (Ohm)
+RTH_C = 1.65      # K/W (junction→case)
+RTH_V = 1e5       # K/W (junction→ambient)
+C_TH  = 1.5       # J/K  (lumped capacitance)
+T_ENV = 20.0      # °C
+R_DSON = 0.63e-3  # Ω
 
 # --------------------------------------------------------------------
-# Sampling period (will be overwritten at runtime by optuna_run.py)
+# Sampling period (can be overwritten at runtime)
 # --------------------------------------------------------------------
-DT = 1e-2         # float (seconds)
+DT = 1e-2  # seconds
 
 # --------------------------------------------------------------------
 # Data-augmentation parameters (cycle-level)
 # --------------------------------------------------------------------
-# Number of *additional* synthetic duty-cycles generated via simple
-# noise & scaling tricks defined in `data_utils.augment_cycle()`.
-AUG_CYCLES = 2   # int ≥ 0
+AUG_CYCLES = 2    # int ≥ 0
+NOISE_STD  = 0.02 # relative std for temperature noise
+SCALE_STD  = 0.05 # relative std for power scaling
+TEMP_OFFSET_STD = 2.0  # °C std of quasi-static offset
+JITTER_SAMPLES  = 5    # max temporal jitter (samples)
 
-# Fractions used when splitting *cycles* (as opposed to individual
-# samples) into train/val/test datasets after augmentation.
-TRAIN_FRAC = 0.70 # float in [0,1]
-VAL_FRAC   = 0.15 # float in [0,1]
+# --------------------------------------------------------------------
+# Training defaults (moved here from script)
+# --------------------------------------------------------------------
+# Epoch gate for enabling best/early-stop
+MIN_EPOCHS_BEST = 25
 
-# Standard deviation (relative) of the additive Gaussian noise applied
-# to temperature channels during augmentation.
-NOISE_STD = 0.02  # float ≥ 0
+# ReduceLROnPlateau scheduler settings
+LR_SCHED_PLATEAU = True
+LR_FACTOR        = 0.5
+LR_PATIENCE      = 4
+LR_MIN           = 1e-6
 
-# Standard deviation (relative) of the multiplicative scaling applied
-# to power traces during augmentation (≈ ±5 %).
-SCALE_STD = 0.05  # float ≥ 0
+# QAT observer tuning
+EMA_DECAY_QAT    = 0.99
+Q_DELAY_UPDATES  = 400
+Q_FREEZE_UPDATES = 4000
 
-# Varianza (°C) dell’offset termico quasi-statico che simula
-# cambiamenti lentamente varianti di ambient/cooling.
-TEMP_OFFSET_STD = 2.0      # float ≥ 0  (≈ ±2 °C 1 σ)
+# --------------------------------------------------------------------
+# Runtime controls (were CLI flags; now centralized here)
+# --------------------------------------------------------------------
+# Device selection
+try:
+    import torch as _torch
+    DEVICE = "cuda" if _torch.cuda.is_available() else "cpu"
+except Exception:
+    DEVICE = "cpu"
 
-# Massimo jitter temporale (campioni) applicato al ciclo completo
-# (P, Tbp, Tjr) per emulare variazioni di fase / latenze di misura.
-JITTER_SAMPLES  = 5        # int ≥ 0    (~5 × DT ≈ 50 ms con dt=0.01 s)
+# AMP (mixed precision)
+AMP_ENABLED = True           # bool
+AMP_DTYPE   = "bf16"         # "bf16" or "fp16"
+
+# Activation checkpointing / TBPTT
+CKPT        = False          # bool (coarse checkpointing fallback)
+CKPT_CHUNK  = 16             # int (used by fine-grained ckpt if model supports)
+TBPTT_K     = 0              # int (0=disabled)
+
+# Optimization
+ACCUM       = 2              # gradient accumulation steps
+FUSED_ADAM  = True           # try fused Adam if available
+COMPILE     = 0              # torch.compile (0/1)
+
+# Validation cadence
+VAL_INTERVAL     = 1         # validate every K epochs
+VAL_MAX_BATCHES  = 0         # 0 = no limit
+
+# DataLoader settings
+import os as _os
+WORKERS   = min(8, max(1, (_os.cpu_count() or 2)//2))  # sensible default
+PIN_MEMORY = True
+PERSIST    = True
+PREFETCH   = 4
+
+# Temporal mixed-precision (time-aware scaling only)
+MP_TIME         = 0          # 0/1
+MP_TAU_THR      = 0.08       # °C/s threshold
+MP_SCALE_MUL    = 1.5        # scale factor for S_gate in mp-time
+MP_RSHIFT_DELTA = -1         # delta rshift for S_gate in mp-time
 
 # --------------------------------------------------------------------
 # End of configuration – nothing below this line should normally be

@@ -1,0 +1,33 @@
+{
+  "input_size": 2,
+  "hidden_size": 16,
+  "num_layers": 1,
+  "fc": {
+    "Sx": 0.05000000074505806,
+    "Sw": 0.05000000074505806,
+    "bias_fp32": true
+  },
+  "cells": [
+    {
+      "idx": 0,
+      "ih": {
+        "Sx": 0.05000000074505806,
+        "Sw": 0.05000000074505806,
+        "bias_fp32": true
+      },
+      "hh": {
+        "Sx": 0.05000000074505806,
+        "Sw": 0.05000000074505806,
+        "bias_fp32": true
+      },
+      "S_gate_q8": 32,
+      "S_tanhc_q8": 64
+    }
+  ],
+  "mp_time": {
+    "enabled": true,
+    "tau_thr": 0.08,
+    "grid_base": 256.0,
+    "grid_fine": 768.0
+  }
+}

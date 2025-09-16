@@ -476,18 +476,29 @@ class LSTMModelInt8QAT(nn.Module):
         return W, b_i32, Sx, Sw
 
     @torch.no_grad()
-    def compute_requant(self, Sx, Sw, S_pre, bits=15):
+    def compute_requant(self, Sx: float, Sw: float, S_pre: float, *, max_shift: int = 30):
         """
-        Calcola (mult_q15, rshift) per out_int = sat(((sum_i32) * mult_q15) >> rshift),
-        approssimando (Sx*Sw / S_pre).
+        Ritorna (mult_q15, rshift) tali che  accum_i32 * (Sx*Sw)/S_pre ≈ (accum_i32 * mult_q15) >> rshift
+        Robusto a S_pre ~ 0 e senza loop infinito.
         """
-        target = (Sx*Sw) / max(1e-12, S_pre)
-        # porta target in forma m/2^r con m ~ Q15
-        rshift = max(0, int(math.ceil(max(0.0, math.log2(target))) - 14))  # cerca rshift piccolo
-        m = int(round(target * (1<<rshift)))
-        # ricentra m su Q15 se troppo grande/piccolo
-        while m >= (1<<15): m >>= 1; rshift -= 1
-        while m <  (1<<14): m <<= 1; rshift += 1
-        m = max(1, min((1<<15)-1, m))
-        return m, rshift
+        eps = 1e-12
+        Sx = float(Sx)
+        Sw = float(Sw)
+        S_pre = float(max(S_pre, eps))
+        M = (Sx * Sw) / S_pre
+        # casi degeneri
+        if not math.isfinite(M) or M <= eps:
+            return 0, 0
+        # M = mant * 2**exp, con mant in [0.5, 1)
+        mant, exp = math.frexp(M)
+        m = int(round(mant * (1 << 15)))  # Q15
+        r = 15 - exp                      # così che M ≈ m / 2**r
+        if m <= 0:
+            return 0, 0
+        # normalizza nei limiti (m ≤ 32767, r ≥ 0)
+        while m > 32767:
+            m = (m + 1) >> 1
+            r -= 1
+        r = int(max(0, min(max_shift, r)))
+        return m, r
 

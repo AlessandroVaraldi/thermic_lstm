@@ -130,6 +130,70 @@ def evaluate_epoch(model, dl, device, mu_y, std_y, *, amp_enabled: bool, amp_dty
     yt = np.concatenate(gts)   if gts   else np.empty((0,), dtype=float)
     return tot/max(n,1), yh, yt
 
+# ====================== QAT robustness helpers ======================
+def _maybe_import_fakequant():
+    try:
+        from src.qat_int8 import FakeQuant
+        return FakeQuant
+    except Exception:
+        return None
+
+@torch.no_grad()
+def _recalibrate_qat(model, dl, device, max_steps: int = 64):
+    """
+    Passa alcuni batch in avanti con observer attivi per aggiornare min/max/scale,
+    poi rifreeza se supportato.
+    """
+    model.train()
+    steps = 0
+    for xb, _ in dl:
+        xb = xb.to(device, non_blocking=True)
+        _ = model(xb)
+        steps += 1
+        if steps >= max_steps:
+            break
+    # rifreeze (se disponibile)
+    FakeQuant = _maybe_import_fakequant()
+    if FakeQuant is not None:
+        for m in model.modules():
+            if isinstance(m, FakeQuant):
+                if hasattr(m, "freeze"):
+                    m.freeze()
+    model.eval()
+
+def _print_clamp_stats(model):
+    """
+    Stampa % di clamp per modulo FakeQuant se l'API lo espone.
+    """
+    FakeQuant = _maybe_import_fakequant()
+    if FakeQuant is None:
+        return
+    stats = []
+    for name, m in model.named_modules():
+        if isinstance(m, FakeQuant):
+            pct = None
+            if hasattr(m, "clamp_ratio"):
+                try:
+                    pct = float(m.clamp_ratio()) * 100.0
+                except Exception:
+                    pct = None
+            elif hasattr(m, "get_clamp_stats"):
+                try:
+                    mn, mx, tot = m.get_clamp_stats()
+                    if tot > 0:
+                        pct = 100.0 * float(mn + mx) / float(tot)
+                except Exception:
+                    pct = None
+            if pct is not None:
+                stats.append((name, pct))
+    if stats:
+        s = " | ".join(f"{n}:{p:.2f}%" for n,p in stats)
+        print(f"[clamp] {s}")
+
+# Toggle opzionali (default: disattivati)
+ENABLE_INPUT_SOFT_CLIP = True
+ENABLE_SCALE_SCAN      = True
+
 # ====================== training (QAT) ======================
 def train_qat(
     model, dl_train, dl_val, device,
@@ -142,7 +206,10 @@ def train_qat(
     amp_enabled: bool = AMP_ENABLED, amp_dtype: torch.dtype = torch.bfloat16,
     use_ckpt: bool = CKPT, ckpt_chunk: int = CKPT_CHUNK, tbptt_k: int = TBPTT_K,
     pin: bool = PIN_MEMORY, accum: int = ACCUM, val_interval: int = VAL_INTERVAL, val_max_batches: int | None = None,
-    use_fused_adam: bool = FUSED_ADAM
+    use_fused_adam: bool = FUSED_ADAM,
+    # nuovi opzionali per robustezza
+    mu_x_soft: np.ndarray | None = None, std_x_soft: np.ndarray | None = None, x_clip_sigma: float | None = None,
+    lambda_c_reg: float = 0.0
 ):
     # Optimizer (try fused Adam if supported)
     try:
@@ -173,6 +240,12 @@ def train_qat(
     std_x_t= torch.tensor(std_x, device=device, requires_grad=False)
     mu_y_t = torch.tensor(mu_y,  device=device, requires_grad=False)
     std_y_t= torch.tensor(std_y, device=device, requires_grad=False)
+    # soft clip tensors (se abilitati)
+    if mu_x_soft is not None and std_x_soft is not None and x_clip_sigma is not None:
+        mu_x_t_soft  = torch.tensor(mu_x_soft,  device=device, requires_grad=False)
+        std_x_t_soft = torch.tensor(std_x_soft, device=device, requires_grad=False)
+    else:
+        mu_x_t_soft = std_x_t_soft = None
 
     accum = max(1, int(accum))
     step_mod = 0
@@ -191,6 +264,24 @@ def train_qat(
             lam_ss = lambda_ss * scale
             lam_tr = lambda_tr * scale
 
+            # --- Smart refreeze nelle ultime epoche ---
+            REFREEZE_START_EPOCH = max(1, max_epochs - 5)
+            FakeQuant = _maybe_import_fakequant()
+            if FakeQuant is not None and epoch == REFREEZE_START_EPOCH:
+                for m in model.modules():
+                    if isinstance(m, FakeQuant):
+                        try:
+                            if hasattr(m, "set_qat_hparams"):
+                                m.set_qat_hparams(
+                                    ema_decay=min(0.90, EMA_DECAY_QAT),
+                                    quant_delay=0,
+                                    freeze_after=10
+                                )
+                            if hasattr(m, "unfreeze"):
+                                m.unfreeze()
+                        except Exception:
+                            pass
+
             # ---------------- TRAIN ----------------
             model.train()
             loss_sum, n_batches = 0.0, 0
@@ -199,6 +290,13 @@ def train_qat(
             for xb, yb in dl_train:
                 xb = xb.to(device, non_blocking=pin)
                 yb = yb.to(device, non_blocking=pin)
+
+                # Clip morbido degli input normalizzati (opt-in)
+                if mu_x_t_soft is not None and std_x_t_soft is not None and x_clip_sigma is not None:
+                    with torch.no_grad():
+                        lo = (mu_x_t_soft - x_clip_sigma*std_x_t_soft - mu_x_t)/std_x_t
+                        hi = (mu_x_t_soft + x_clip_sigma*std_x_t_soft - mu_x_t)/std_x_t
+                        xb.clamp_(lo, hi)
 
                 # twin-window: forward on xb and xb_prev (shifted by 1)
                 # to obtain in a single pass both y_hat (t) and T_prev (t-1),
@@ -241,6 +339,27 @@ def train_qat(
                         loss_tr = torch.tensor(0.0, device=device)
 
                     loss = loss_data + lam_ss * loss_ss + lam_tr * loss_tr
+                    # Regolarizzazione morbida su c_t (se il forward può restituirla)
+                    if lambda_c_reg > 0.0 and (_supports_kwargs(model.forward, {"return_state"}) or _supports_kwargs(model.forward, {"return_c"})):
+                        try:
+                            ycat2 = model(
+                                xcat,
+                                use_ckpt=use_ckpt, ckpt_chunk=int(ckpt_chunk), tbptt_k=int(tbptt_k),
+                                **({"return_state": True} if _supports_kwargs(model.forward, {"return_state"}) else {"return_c": True})
+                            )
+                            c_t = None
+                            if isinstance(ycat2, tuple):
+                                for part in ycat2:
+                                    if isinstance(part, (list, tuple)) and len(part) == 2:
+                                        c_t = part[1]
+                                    elif isinstance(part, dict) and "c" in part:
+                                        c_t = part["c"]
+                            if c_t is not None:
+                                C_MAX = torch.tensor(5.0, device=device)
+                                loss_reg_c = torch.mean(torch.relu(torch.abs(c_t) - C_MAX) ** 2)
+                                loss = loss + float(lambda_c_reg) * loss_reg_c
+                        except Exception:
+                            pass
                     if accum > 1:
                         loss = loss / accum
 
@@ -262,6 +381,14 @@ def train_qat(
             # ---------------- VAL ----------------
             do_val = (epoch % max(1, val_interval)) == 0
             if do_val:
+                # (1) aggiorna observer con val senza quant, no grad
+                _cm_obs = model.quant_eval(False) if hasattr(model, "quant_eval") else nullcontext()
+                with _cm_obs, torch.no_grad():
+                    for i, (xb, yb) in enumerate(dl_val):
+                        if val_max_batches is not None and i >= val_max_batches:
+                            break
+                        _ = model(xb.to(device))
+                # (2) misura in quant mode
                 _cm = model.quant_eval(True) if hasattr(model, "quant_eval") else nullcontext()
                 with _cm:
                     val_mse, _, _ = evaluate_epoch(
@@ -319,6 +446,7 @@ def train_qat(
             if do_val and ckpt_active and patience_left <= 0:
                 print(f"Early stopping (best val={best_val:.6f} in normalized space)")
                 break
+            _print_clamp_stats(model)
 
     except KeyboardInterrupt:
         print("User interrupt.")
@@ -419,6 +547,41 @@ def main():
         S_tanhc_q8=64,
     ).to(device)
 
+    # (opzionale) mini grid scale per gate/tanh(c)
+    if ENABLE_SCALE_SCAN:
+        def _dry_run_score(model_try, dl, device, steps=200):
+            model_try.train()
+            devtype = _devtype_from_device(device)
+            opt = torch.optim.SGD(model_try.parameters(), lr=1e-4)
+            it = 0
+            for xb, yb in dl:
+                xb = xb.to(device); yb = yb.to(device)
+                with autocast(device_type=devtype, dtype=torch.bfloat16, enabled=True):
+                    y = model_try(xb)
+                    loss = Fnn.mse_loss(y, yb)
+                loss.backward(); opt.step(); opt.zero_grad(set_to_none=True)
+                it += 1
+                if it >= steps: break
+            _cm = model_try.quant_eval(True) if hasattr(model_try, "quant_eval") else nullcontext()
+            with _cm:
+                mse_q, _, _ = evaluate_epoch(model_try, dl_va, device, mu_y, std_y, amp_enabled=True, amp_dtype=torch.bfloat16, max_batches=10)
+            return mse_q
+        candidates = [(32,64), (32,128), (16,64)]
+        best_cfg, best_score = None, float("inf")
+        for sg, st in candidates:
+            m_try = LSTMModelInt8QAT(INPUT_SIZE, HIDDEN_SIZE, NUM_LAYERS, DROPOUT, S_gate_q8=sg, S_tanhc_q8=st).to(device)
+            try:
+                sc = _dry_run_score(m_try, dl_tr, device, steps=200)
+                print(f"[scale-scan] S_gate={sg} S_tanhc={st} => val_q MSE={sc:.6f}")
+                if sc < best_score:
+                    best_score, best_cfg = sc, (sg, st)
+            except Exception as e:
+                print(f"[scale-scan] skip {sg}/{st}: {e}")
+        if best_cfg is not None:
+            sg, st = best_cfg
+            print(f"[scale-scan] scelgo S_gate={sg}, S_tanhc={st}")
+            model = LSTMModelInt8QAT(INPUT_SIZE, HIDDEN_SIZE, NUM_LAYERS, DROPOUT, S_gate_q8=sg, S_tanhc_q8=st).to(device)
+
     # QAT observers
     try:
         from src.qat_int8 import FakeQuant
@@ -473,11 +636,37 @@ def main():
         amp_enabled=bool(AMP_ENABLED), amp_dtype=amp_dtype,
         use_ckpt=bool(CKPT), ckpt_chunk=int(CKPT_CHUNK), tbptt_k=int(TBPTT_K),
         pin=bool(PIN_MEMORY), accum=int(ACCUM), val_interval=int(VAL_INTERVAL), val_max_batches=val_max_batches,
-        use_fused_adam=bool(FUSED_ADAM)
+        use_fused_adam=bool(FUSED_ADAM),
+        # input soft clip (opt-in)
+        mu_x_soft=(mu_x if not ENABLE_INPUT_SOFT_CLIP else mu_x),  # placeholder; vedi blocco sotto per soft stats reali
+        std_x_soft=(std_x if not ENABLE_INPUT_SOFT_CLIP else std_x),
+        x_clip_sigma=(None if not ENABLE_INPUT_SOFT_CLIP else 5.0),
+        # reg su c_t (disattivata di default; metti 1e-4 se supportata)
+        lambda_c_reg=0.0
     )
 
     # ------------ save (best + export) ------------
     best_path = CKPT_DIR/"best_qat.pth"; last_path = CKPT_DIR/"last_qat.pth"
+    # Gap-check float vs quant su validation + eventuale micro-recalibrazione
+    try:
+        _cm_f = model.quant_eval(False) if hasattr(model, "quant_eval") else nullcontext()
+        with _cm_f:
+            mse_float, _, _ = evaluate_epoch(model, dl_va, device, mu_y, std_y,
+                                             amp_enabled=bool(AMP_ENABLED), amp_dtype=amp_dtype,
+                                             max_batches=val_max_batches)
+        _cm_q = model.quant_eval(True) if hasattr(model, "quant_eval") else nullcontext()
+        with _cm_q:
+            mse_quant, _, _ = evaluate_epoch(model, dl_va, device, mu_y, std_y,
+                                             amp_enabled=bool(AMP_ENABLED), amp_dtype=amp_dtype,
+                                             max_batches=val_max_batches)
+        gap = (mse_quant - mse_float) / max(mse_float, 1e-12)
+        print(f"[gap] val MSE quant vs float: {gap*100:.2f}%")
+        if gap > 0.10:
+            print("[gap] >10%: eseguo micro-recalibrazione observer prima dell'export")
+            _recalibrate_qat(model, dl_tr, device, max_steps=64)
+    except Exception as e:
+        print(f"[gap] skip: {e}")
+
     torch.save({"model": model.state_dict()}, best_path)
 
     try:
@@ -503,6 +692,7 @@ def main():
     test_rmse= rmse(y_pred_test, y_true_test)
     test_r2  = r2  (y_pred_test, y_true_test)
 
+    _print_clamp_stats(model)
     print("\n=== Test (denormalized, °C) ===")
     print(f"MSE : {test_mse:.6f}")
     print(f"MAE : {test_mae:.6f}")

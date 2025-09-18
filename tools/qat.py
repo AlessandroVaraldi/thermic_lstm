@@ -1,3 +1,6 @@
+# qat.py — Quantization-Aware Training script (INT8) for PI-LSTM
+# (Rewritten for clarity/robustness without removing features)
+
 from __future__ import annotations
 import json, os, time, math, inspect
 from dataclasses import dataclass
@@ -30,6 +33,8 @@ from src.config import (
     COMPILE, FUSED_ADAM, VAL_INTERVAL, VAL_MAX_BATCHES,
     WORKERS, PIN_MEMORY, PERSIST, PREFETCH,
     MP_TIME, MP_TAU_THR, MP_SCALE_MUL, MP_RSHIFT_DELTA,
+    # plotting path alias
+    PLOTS_DIR as _PLOTS_DIR
 )
 from src.data_utils import (
     seed_everything, load_all_csvs, compute_powers,
@@ -39,8 +44,9 @@ from src.dataset import WindowDataset
 from src.phys_models import T_steady_state, transient_residual
 from src.qat_int8 import LSTMModelInt8QAT
 
+# Ensure output dirs exist (use centralized config PLOTS_DIR)
 CKPT_DIR = Path("checkpoints"); CKPT_DIR.mkdir(parents=True, exist_ok=True)
-PLOTS_DIR = Path("plots");      PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+PLOTS_DIR = Path(_PLOTS_DIR);   PLOTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # ====================== utils ======================
 @dataclass
@@ -80,6 +86,7 @@ def fmt_hms(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 def _supports_kwargs(fn, keys):
+    """Retro-compatibility hook: allows passing optional kwargs to forward() if supported."""
     try:
         sig = inspect.signature(fn)
         has_var_kw = any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values())
@@ -92,7 +99,10 @@ def _devtype_from_device(device: str | torch.device) -> str:
     return "cuda" if ("cuda" in s and torch.cuda.is_available()) else "cpu"
 
 def forward_model(model, xb, *, use_ckpt: bool, ckpt_chunk: int, tbptt_k: int):
-    """Try TBPTT/ckpt via kwargs, else fallback."""
+    """
+    Runs the model forward, trying to use TBPTT/checkpoint via kwargs if supported.
+    Backward compatibility: if forward() does not accept these kwargs, fallback to checkpoint wrapper.
+    """
     if _supports_kwargs(model.forward, {"use_ckpt", "ckpt_chunk", "tbptt_k"}):
         return model(xb, use_ckpt=use_ckpt, ckpt_chunk=int(ckpt_chunk), tbptt_k=int(tbptt_k))
     if use_ckpt:
@@ -137,8 +147,12 @@ def train_qat(
     # Optimizer (try fused Adam if supported)
     try:
         opt = torch.optim.Adam(model.parameters(), lr=lr, fused=bool(use_fused_adam))
+        if bool(use_fused_adam):
+            print("[opt] fused Adam enabled")
     except TypeError:
         opt = torch.optim.Adam(model.parameters(), lr=lr)
+        if bool(use_fused_adam):
+            print("[opt] fused Adam not available on this PyTorch; falling back")
 
     # LR scheduler (epoch-level)
     sched = ReduceLROnPlateau(
@@ -163,11 +177,14 @@ def train_qat(
     accum = max(1, int(accum))
     step_mod = 0
 
+    # Info about gating early-stop/best
+    gate_epoch_msg = max(int(warmup_epochs), int(MIN_EPOCHS_BEST))
+    print(f"[best] best/early-stop enabled from epoch {gate_epoch_msg} "
+          f"(warmup_epochs={int(warmup_epochs)}, MIN_EPOCHS_BEST={int(MIN_EPOCHS_BEST)})")
+
     try:
         for epoch in range(1, max_epochs+1):
             ep_t0 = time.perf_counter()
-            if epoch == 1:
-                print(f"[best] best/early-stop abilitati da epoch {max(int(warmup_epochs), MIN_EPOCHS_BEST)}")
 
             # PI lambda warm-up
             scale = min(1.0, epoch / max(1, warmup_epochs)) if warmup_epochs>0 else 1.0
@@ -183,7 +200,9 @@ def train_qat(
                 xb = xb.to(device, non_blocking=pin)
                 yb = yb.to(device, non_blocking=pin)
 
-                # twin-window
+                # twin-window: forward on xb and xb_prev (shifted by 1)
+                # to obtain in a single pass both y_hat (t) and T_prev (t-1),
+                # used in the transient residual loss.
                 xb_prev = torch.cat([xb[:, :1, :], xb[:, :-1, :]], dim=1)
                 xcat    = torch.cat([xb, xb_prev], dim=0)
 
@@ -194,7 +213,7 @@ def train_qat(
                     T_prev = ycat[B:]          # (B,) normalized
 
                     y_hat_deg  = y_hat * std_y_t + mu_y_t       # °C
-                    loss_data  = Fnn.mse_loss(y_hat, yb)
+                    loss_data  = Fnn.mse_loss(y_hat, yb)        # (normalized space)
 
                     # last time-step (denorm)
                     x_last = xb[:, -1, :]
@@ -257,7 +276,7 @@ def train_qat(
             history["val"].append(val_mse)
 
             # ---------------- CKPT / EARLY STOP + LOG -----------
-            gate_epoch = max(int(warmup_epochs), MIN_EPOCHS_BEST)
+            gate_epoch = max(int(warmup_epochs), int(MIN_EPOCHS_BEST))
             ckpt_active = (epoch >= gate_epoch)
             improved = do_val and ckpt_active and (val_mse < best_val - 1e-12)
             if improved:
@@ -269,7 +288,7 @@ def train_qat(
                 patience_left -= 1
                 tag = " "
             elif do_val and not ckpt_active:
-                tag = "w"
+                tag = "w"  # within warmup gate
             else:
                 tag = "·"
 
@@ -277,7 +296,7 @@ def train_qat(
             if sched is not None and do_val:
                 sched.step(val_mse)
 
-            # save ckpts
+            # save ckpts (last every epoch, best on improvement)
             try:
                 torch.save({"model": model.state_dict()}, last_path)
             except Exception as e:
@@ -287,8 +306,10 @@ def train_qat(
                     torch.save({"model": best_w}, best_path)
                 except Exception as e:
                     print(f"[ckpt] best save skipped: {e}")
+
+            # Note (units): val is MSE in normalized space; test metrics in °C
             print(
-                f"[{epoch:03d}] train={train_avg:.6f}  val={val_mse:.6f}  "
+                f"[{epoch:03d}] train={train_avg:.6f}  val={val_mse:.6f} (norm)  "
                 f"λss={lam_ss:.2e} λtr={lam_tr:.2e}  "
                 f"lr={opt.param_groups[0]['lr']:.2e} "
                 f"t/ep={fmt_hms(ep_dt)} {tag}",
@@ -296,26 +317,28 @@ def train_qat(
             )
 
             if do_val and ckpt_active and patience_left <= 0:
-                print(f"Early stopping (best val={best_val:.6f})")
+                print(f"Early stopping (best val={best_val:.6f} in normalized space)")
                 break
 
     except KeyboardInterrupt:
         print("User interrupt.")
 
+    # Restore best weights
     model.load_state_dict(best_w)
+
     # plot curves
     try:
         import matplotlib.pyplot as plt
         plt.figure()
         xs = range(1, len(history["train"])+1)
         plt.plot(xs, history["train"], label="Train")
-        plt.plot(xs, history["val"],   label="Val")
+        plt.plot(xs, history["val"],   label="Val (norm)")
         plt.xlabel("Epoch"); plt.ylabel("Loss")
         plt.title("QAT PI-LSTM – loss curves")
         plt.legend(); plt.grid(True); plt.tight_layout()
         plt.savefig(PLOTS_DIR/"loss_curves_qat.png", dpi=PLOT_DPI); plt.close()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[plot] skipped: {type(e).__name__}: {e}")
 
     return model, history, best_val
 
@@ -330,21 +353,22 @@ def main():
 
     cycles_t, cycles_P, cycles_Tbp, cycles_Tjr = [], [], [], []
     dts = [float(np.median(np.diff(cols["t"]))) for cols in datasets]
-    dt = float(np.median(dts))
+    dt_all = float(np.median(dts))
     if (max(dts) - min(dts)) > 1e-6:
-        print(f"[warn] dt not uniform across CSVs — median={dt:.9f}, range=[{min(dts):.9f},{max(dts):.9f}]")
+        print(f"[warn] dt not uniform across CSVs — median={dt_all:.9f}, range=[{min(dts):.9f},{max(dts):.9f}]")
 
     for cols in datasets:
         P = compute_powers(cols["Id"], cols["Iq"])
         cycles_t.append(cols["t"]); cycles_P.append(P); cycles_Tbp.append(cols["Tbp"]); cycles_Tjr.append(cols["Tjr"])
         for _ in range(max(0, AUG_CYCLES)):
             P2, Tbp2, Tjr2 = augment_cycle(P, cols["Tbp"], cols["Tjr"])
-            shift = (cycles_t[-1][-1] - cycles_t[-1][0]) + dt
+            shift = (cycles_t[-1][-1] - cycles_t[-1][0]) + dt_all
             cycles_t.append(cols["t"] + shift)
             cycles_P.append(P2); cycles_Tbp.append(Tbp2); cycles_Tjr.append(Tjr2)
 
     n_cycles = len(cycles_P)
     split = split_cycles(n_cycles, TRAIN_FRAC, VAL_FRAC, SEED)
+    print(f"[data] cycles: total={n_cycles}  split: train={len(split.train)} val={len(split.val)} test={len(split.test)}")
 
     # ------------ stats (train only) ------------
     PAD = WINDOW_SIZE - 1
@@ -352,14 +376,14 @@ def main():
         pad = np.full(PAD, np.nan, dtype=float)
         return np.concatenate([np.concatenate([a, pad]) for a in arrs])[:-PAD]
 
-    P_train   = cat_with_pad([cycles_P[i]   for i in split.train])
-    Tbp_train = cat_with_pad([cycles_Tbp[i] for i in split.train])
-    Tjr_train = cat_with_pad([cycles_Tjr[i] for i in split.train])
+    P_train   = cat_with_pad([cycles_P[i]   for i in split.train]) if split.train else np.array([], dtype=float)
+    Tbp_train = cat_with_pad([cycles_Tbp[i] for i in split.train]) if split.train else np.array([], dtype=float)
+    Tjr_train = cat_with_pad([cycles_Tjr[i] for i in split.train]) if split.train else np.array([], dtype=float)
 
-    mu_x  = np.nanmean(np.column_stack([P_train, Tbp_train]), axis=0).astype(np.float32)
-    std_x = np.nanstd (np.column_stack([P_train, Tbp_train]), axis=0).astype(np.float32) + 1e-6
-    mu_y  = float(np.nanmean(Tjr_train).astype(np.float32))
-    std_y = float(np.nanstd (Tjr_train).astype(np.float32) + 1e-6)
+    mu_x  = np.nanmean(np.column_stack([P_train, Tbp_train]), axis=0).astype(np.float32) if P_train.size else np.array([0.0, 0.0], dtype=np.float32)
+    std_x = (np.nanstd (np.column_stack([P_train, Tbp_train]), axis=0).astype(np.float32) + 1e-6) if P_train.size else np.array([1.0, 1.0], dtype=np.float32)
+    mu_y  = float(np.nanmean(Tjr_train).astype(np.float32)) if Tjr_train.size else 0.0
+    std_y = float(np.nanstd (Tjr_train).astype(np.float32) + 1e-6) if Tjr_train.size else 1.0
 
     # ------------ datasets & loaders ------------
     nw  = int(WORKERS)
@@ -390,8 +414,9 @@ def main():
         hidden_size=HIDDEN_SIZE,
         num_layers=NUM_LAYERS,
         dropout_p=DROPOUT,
-        S_gate_q8=int(getattr(LSTMModelInt8QAT, "DEFAULT_S_GATE_Q8", 32)),   # fallback if needed
-        S_tanhc_q8=int(getattr(LSTMModelInt8QAT, "DEFAULT_S_TANHC_Q8", 64)),
+        # explicit (avoids getattr on class defaults not defined)
+        S_gate_q8=32,
+        S_tanhc_q8=64,
     ).to(device)
 
     # QAT observers
@@ -408,7 +433,7 @@ def main():
     except Exception as _e:
         print(f"[qat] observer tuning skipped: {_e}")
 
-    # temporal mixed precision
+    # temporal mixed precision (tanh(c) grid only)
     if int(MP_TIME):
         if hasattr(model, "enable_time_mixed_precision"):
             try:
@@ -419,7 +444,7 @@ def main():
                 )
                 print(f"[mp-time] enabled: tau_thr={MP_TAU_THR}, scale_mul={MP_SCALE_MUL}, rshift_delta={MP_RSHIFT_DELTA}")
             except Exception as e:
-                print(f"[mp-time] skipped: {e}")
+                print(f"[mp-time] skipped: {type(e).__name__}: {e}")
         else:
             print("[mp-time] model does not support enable_time_mixed_precision(), skipped")
 
@@ -427,17 +452,22 @@ def main():
     if int(COMPILE):
         try:
             model = torch.compile(model, mode="reduce-overhead")
+            print("[compile] torch.compile enabled (reduce-overhead)")
         except Exception as e:
-            print(f"[compile] skipped: {e}")
+            print(f"[compile] skipped: {type(e).__name__}: {e}")
 
     # ------------ train ------------
     amp_dtype = torch.bfloat16 if str(AMP_DTYPE).lower() == "bf16" else torch.float16
     val_max_batches = None if int(VAL_MAX_BATCHES) <= 0 else int(VAL_MAX_BATCHES)
 
+    # Note dt: we compute dt only on TRAIN cycles for consistency with TR loss
+    dt_train = float(np.median([float(np.median(np.diff(cycles_t[i]))) for i in split.train])) if split.train else DT
+    print(f"[dt] dt_all={dt_all:.9f}  dt_train={dt_train:.9f} (used for transient residual)")
+
     model, hist, best_val = train_qat(
         model, dl_tr, dl_va, device,
         mu_x=mu_x, std_x=std_x, mu_y=mu_y, std_y=std_y,
-        dt=float(np.median([float(np.median(np.diff(cycles_t[i]))) for i in split.train])) if split.train else DT,
+        dt=dt_train,
         lambda_ss=LAMBDA_SS, lambda_tr=LAMBDA_TR,
         lr=LEARNING_RATE, max_epochs=MAX_EPOCHS, patience=PATIENCE, warmup_epochs=LAMBDA_WARMUP_EPOCHS,
         amp_enabled=bool(AMP_ENABLED), amp_dtype=amp_dtype,
@@ -446,7 +476,7 @@ def main():
         use_fused_adam=bool(FUSED_ADAM)
     )
 
-    # ------------ save ------------
+    # ------------ save (best + export) ------------
     best_path = CKPT_DIR/"best_qat.pth"; last_path = CKPT_DIR/"last_qat.pth"
     torch.save({"model": model.state_dict()}, best_path)
 
@@ -460,7 +490,7 @@ def main():
             (CKPT_DIR/"model_quant.h").write_text(hdr)
             print(f"[export quant] model_quant.h saved")
     except Exception as e:
-        print(f"[export quant] skipped: {e}")
+        print(f"[export quant] skipped: {type(e).__name__}: {e}")
 
     # ------------ test metrics ------------
     _cm = model.quant_eval(True) if hasattr(model, "quant_eval") else nullcontext()
@@ -489,8 +519,8 @@ def main():
     meta = {
         "qat": True,
         "hidden": HIDDEN_SIZE, "layers": NUM_LAYERS, "dropout": DROPOUT,
-        "S_gate_q8": int(getattr(LSTMModelInt8QAT, "DEFAULT_S_GATE_Q8", 32)),
-        "S_tanhc_q8": int(getattr(LSTMModelInt8QAT, "DEFAULT_S_TANHC_Q8", 64)),
+        "S_gate_q8": 32,
+        "S_tanhc_q8": 64,
         "epochs": MAX_EPOCHS, "batch": BATCH_SIZE, "lr": LEARNING_RATE,
         "lambda_ss": LAMBDA_SS, "lambda_tr": LAMBDA_TR, "warmup": LAMBDA_WARMUP_EPOCHS,
         "mu_x": mu_x.tolist(), "std_x": std_x.tolist(), "mu_y": mu_y, "std_y": std_y,
@@ -507,7 +537,11 @@ def main():
         "fused_adam": int(FUSED_ADAM)
     }
     (CKPT_DIR/"meta_qat.json").write_text(json.dumps(meta, indent=2))
-    print(f"\nSaved: {best_path}, {last_path}, {CKPT_DIR/'meta_qat.json'}")
+
+    # Final save note: at this point *best* has been rewritten;
+    # *last* was updated during training at every epoch.
+    print(f"\nSaved now: {best_path}, {CKPT_DIR/'meta_qat.json'}")
+    print(f"Note: {last_path} was updated every epoch during training.")
 
 if __name__ == "__main__":
     main()

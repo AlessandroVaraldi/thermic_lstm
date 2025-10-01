@@ -755,7 +755,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    #python optuna_run.py --trials 50 --verbose --use-telegram --no-hidden-search --no-layers-search --no-lr-search --no-ss-search --no-tr-search
+    #python train.py --trials 50 --verbose --use-telegram --no-hidden-search --no-layers-search --no-lr-search --no-ss-search --no-tr-search
 
     main(
         n_trials=args.trials,
